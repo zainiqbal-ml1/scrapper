@@ -1,0 +1,9 @@
+curl_cffi>=0.7
+# Stealth browser used only to auto-mint validated DataDome cookies
+# (sb_mint.py). Its slider auto-solve needs macOS Screen Recording +
+# Accessibility permissions; without them, you solve the slider in the
+# window that opens.
+seleniumbase>=4.49
+# Pillow is required by PyAutoGUI/PyScreeze for the slider auto-solve
+# screenshots (SeleniumBase pulls PyAutoGUI but not Pillow).
+Pillow>=11

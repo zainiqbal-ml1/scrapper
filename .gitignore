@@ -1,0 +1,21 @@
+# scraped output - never commit
+data/
+
+# live session secrets
+session.py
+curl.txt
+.cookie_state.json
+.auto_solve_capable
+
+# python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# os / editor / tool noise
+.DS_Store
+.playwright-mcp/
+downloaded_files/
+scrape_run.log
+*.log
