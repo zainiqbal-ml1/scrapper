@@ -44,21 +44,16 @@ sudo apt install xvfb
 xvfb-run python run.py
 ```
 
-### Linux performance
+### Performance and rate limiting
 
-Linux used to feel much slower than macOS because every cookie refresh launched a full SeleniumBase Chrome instance (30–60s+ each), and the pool tried to open several at startup.
+CanLII's anti-bot (DataDome) throttles by **IP address, not by cookie**, so running many parallel workers does **not** speed things up — it just trips rate limits faster. The scraper uses a **single download worker** and one shared cookie, and lets you control throughput with **requests/second**.
 
-The scraper now:
-
-- Uses **system Chrome** for cookie harvest on Linux (faster than SeleniumBase UC).
-- **Lazy cookie pool** — only opens a browser when a cookie is actually needed (one at a time).
-- **429 backoff** — waits 2s with the same cookie before swapping (avoids unnecessary harvests).
-- Defaults to **4 workers** and **4 req/s** on Linux (press Enter at the prompts to accept).
-
-If downloads are still slow, try raising throughput (if your IP tolerates it):
+- All requests share one active cookie; it's only re-harvested when genuinely burned (403/captcha).
+- On HTTP 429 the scraper **automatically slows down** and recovers gradually — it does not churn cookies.
+- Pick a `--rate` your IP tolerates. Start around `2`-`4`; lower it if you see frequent 429s.
 
 ```bash
-python run.py --juris on --db onca --years 2024 --workers 6 --rate 6
+python run.py --juris on --db onca --years 2024 --rate 3
 ```
 
 If downloads stall after solving captcha, enable **Chrome > View > Developer > Allow JavaScript from Apple Events** (required for automatic cookie capture on macOS).
@@ -78,12 +73,12 @@ You will be prompted for:
 1. Jurisdiction (`on`, `ca`, `bc`, … or `all`)
 2. Database(s) (numbers/codes or `all`)
 3. Years (`all`, `2024`, `2020-2024`, etc.)
-4. Workers and requests/second
+4. Max requests/second
 
 Non-interactive:
 
 ```bash
-python run.py --juris on --db onca onsc --years 2020-2024 --workers 3 --rate 3
+python run.py --juris on --db onca onsc --years 2020-2024 --rate 3
 python run.py --juris ca --db all --years all
 ```
 

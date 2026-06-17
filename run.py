@@ -8,12 +8,12 @@ skipped).
 
 Run it in your OWN terminal (it needs to read your keypresses).
 
-Interactive (recommended) - pick state, db(s), years, workers + rate:
+Interactive (recommended) - pick state, db(s), years, rate:
     python run.py
 
 Non-interactive (pass everything):
     python run.py --juris on --db all --years all
-    python run.py --juris on --db onca onsc --years 2020-2024 --workers 3 --rate 3
+    python run.py --juris on --db onca onsc --years 2020-2024 --rate 3
     python run.py --juris all --db all --years all
 """
 import subprocess
@@ -104,12 +104,9 @@ def _discover_dbs_with_refresh(juris: str) -> dict:
             print("Session refreshed. Retrying...\n")
 
 
-def select_workers_rate() -> tuple[int, float]:
-    """Ask how many parallel workers and the max requests/second."""
-    dw = platform_util.default_workers()
+def select_rate() -> float:
+    """Ask the max requests/second (single worker; throughput is rate-limited)."""
     dr = platform_util.default_rate()
-    raw = input(f"Parallel workers [{dw}]: ").strip()
-    workers = int(raw) if raw.isdigit() and int(raw) >= 1 else dw
     raw = input(f"Max requests/second [{dr:g}]: ").strip()
     try:
         rate = float(raw) if raw else dr
@@ -117,32 +114,32 @@ def select_workers_rate() -> tuple[int, float]:
         rate = dr
     if rate <= 0:
         rate = dr
-    return workers, rate
+    return rate
 
 
 def interactive_select():
-    """Prompt for jurisdiction -> db(s) -> years -> workers/rate.
+    """Prompt for jurisdiction -> db(s) -> years -> rate.
 
-    Returns (juris, db_list, years, workers, rate).
+    Returns (juris, db_list, years, rate).
     """
     juris = cs.select_jurisdiction()
     print(flush=True)  # newline after selection so status line is visible
     if juris == "all":
         years = cs.select_years()
-        workers, rate = select_workers_rate()
+        rate = select_rate()
         print("\nAll jurisdictions selected -> every database.")
-        return "all", ["all"], years, workers, rate
+        return "all", ["all"], years, rate
     dbs = _discover_dbs_with_refresh(juris)
     chosen = cs.select_databases(dbs)
     years = cs.select_years()
-    workers, rate = select_workers_rate()
-    return juris, chosen, years, workers, rate
+    rate = select_rate()
+    return juris, chosen, years, rate
 
 
-def run_parallel(juris, db_list, years, workers, rate) -> int:
-    """Parallel scrape (workers>=1). Cookie pool keeps 2 ahead; retries failures."""
+def run_scrape(juris, db_list, years, rate) -> int:
+    """Single-worker scrape with a request/sec cap; retries failures."""
     cmd = [sys.executable, "parallel_scraper.py", "--juris", juris, "--db", *db_list,
-           "--years", years, "--workers", str(max(1, workers)), "--rate", f"{rate:g}"]
+           "--years", years, "--workers", "1", "--rate", f"{rate:g}"]
     return subprocess.call(cmd)
 
 
@@ -162,7 +159,7 @@ def main() -> int:
 
     if not args:
         try:
-            juris, db_list, years, workers, rate = interactive_select()
+            juris, db_list, years, rate = interactive_select()
         except (KeyboardInterrupt, EOFError):
             print("\nCancelled.")
             return 130
@@ -170,7 +167,6 @@ def main() -> int:
         # Non-interactive: read selection from flags (sensible defaults).
         juris = _extract_opt(args, "--juris", str, "on")
         years = _extract_opt(args, "--years", str, "all")
-        workers = _extract_opt(args, "--workers", int, platform_util.default_workers())
         rate = _extract_opt(args, "--rate", float, platform_util.default_rate())
         if "--db" not in args:
             print("Provide --db <code...|all> (or run 'python run.py' for interactive mode).")
@@ -183,13 +179,13 @@ def main() -> int:
             db_list.append(tok)
 
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
-          f"workers={workers} rate={rate:g} req/s | OS: {platform_util.system()} "
+          f"rate={rate:g} req/s | OS: {platform_util.system()} "
           f"| harvest: {platform_util.harvest_backend()}\n")
 
     if juris != "all" and not ensure_session_or_refresh(juris):
         return 130
 
-    return run_parallel(juris, db_list, years, workers, rate)
+    return run_scrape(juris, db_list, years, rate)
 
 
 if __name__ == "__main__":

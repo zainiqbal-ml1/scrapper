@@ -496,8 +496,8 @@ def main() -> int:
     ap.add_argument("--db", nargs="+", required=True, help="DB code(s) or 'all'")
     ap.add_argument("--years", default="all")
     ap.add_argument("--out", default="data")
-    ap.add_argument("--workers", type=int, default=platform_util.default_workers(),
-                    help="Concurrent download workers")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="Concurrent download workers (default 1; rate is the real ceiling)")
     ap.add_argument("--rate", type=float, default=platform_util.default_rate(),
                     help="Max total requests/sec across all workers")
     args = ap.parse_args()
