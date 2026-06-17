@@ -143,11 +143,10 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
 
         cookie = ""
         passed = False
-        captcha_seen = False
         activated = False
         prompt_shown = False
+        tracker = browser_harvest.StablePassTracker()
         fast_deadline = time.monotonic() + browser_harvest.FAST_EXIT_NO_CAPTCHA
-        # timeout_s only applies when no captcha appears; captcha waits until solved.
         no_captcha_deadline = (
             time.monotonic() + (timeout_s or browser_harvest.FAST_EXIT_NO_CAPTCHA)
             if timeout_s
@@ -156,14 +155,14 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
 
         while True:
             raw = _run_as(_as_poll(win_idx), quiet=True)
-            cookie, passed, challenged = browser_harvest.parse_poll(raw)
-            if browser_harvest.cookie_ready(cookie, challenged=challenged):
+            cookie, poll_passed, challenged = browser_harvest.parse_poll(raw)
+            page_ok = poll_passed or browser_harvest.cookie_ready(cookie, challenged=False)
+
+            if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
                 passed = True
                 break
-            if passed and "datadome=" in cookie:
-                break
+
             if challenged:
-                captcha_seen = True
                 if not activated:
                     _run_as(AS_ACTIVATE % win_idx, quiet=True)
                     activated = True
@@ -171,20 +170,24 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
                     prompt_shown = True
                     print(
                         ">>> Captcha detected — solve it in Chrome.\n"
-                        "    (Solve any sliders/checkboxes; window closes when done.)\n",
+                        "    (If a second captcha appears, solve that too.)\n",
                         flush=True,
                     )
-            elif not captcha_seen and time.monotonic() > no_captcha_deadline:
-                if browser_harvest.cookie_ready(cookie, challenged=False):
-                    passed = True
-                    break
+                elif tracker.should_print_second_hint():
+                    print(
+                        ">>> Another captcha step appeared — please solve it too.\n",
+                        flush=True,
+                    )
+            elif tracker.should_print_wait_hint():
+                print(
+                    ">>> First captcha cleared — waiting a few seconds in case another appears...\n",
+                    flush=True,
+                )
+            elif not tracker.captcha_seen and time.monotonic() > no_captcha_deadline:
                 break
             time.sleep(MAC_POLL_INTERVAL)
 
-        if passed or not captcha_seen:
-            _run_as(AS_CLOSE % win_idx, quiet=True)
-        elif browser_harvest.cookie_ready(cookie, challenged=False):
-            passed = True
+        if passed or not tracker.captcha_seen:
             _run_as(AS_CLOSE % win_idx, quiet=True)
 
     if passed and cookie and "datadome=" in cookie:

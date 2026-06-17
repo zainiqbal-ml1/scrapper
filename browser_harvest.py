@@ -1,7 +1,7 @@
 """Cross-platform cookie harvest via a real Chrome window (SeleniumBase).
 
 Shared pass/captcha detection used by AppleScript and SeleniumBase paths.
-Window closes only when CanLII loads with no captcha, or after captcha is solved.
+Window closes only after captcha flow is fully done (including a second step).
 """
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import time
 START_URL = "https://www.canlii.org/en/on/"
 POLL_INTERVAL = 0.4
 FAST_EXIT_NO_CAPTCHA = 20   # seconds: only when no captcha ever appeared
+STABLE_POLLS_NO_CAPTCHA = 4       # ~1.6s with no captcha ever shown
+STABLE_POLLS_AFTER_CAPTCHA = 15   # ~6s after any captcha — catches a second step
 
 # AppleScript + CDP poll: "cookie|||passed|||challenged"
 POLL_JS = (
@@ -58,8 +60,55 @@ def page_passed_html(src: str) -> bool:
 
 
 def cookie_ready(cookie: str, *, challenged: bool) -> bool:
-    """True when document.cookie has a validated datadome and no active challenge."""
+    """True when document.cookie has datadome and no active challenge."""
     return bool(cookie) and "datadome=" in cookie and not challenged
+
+
+class StablePassTracker:
+    """Require several consecutive OK polls before accepting pass.
+
+    CanLII often shows a second captcha a moment after the DataDome slider;
+    a single OK poll was causing an early quit before step two appeared.
+    """
+
+    def __init__(self) -> None:
+        self.captcha_seen = False
+        self.streak = 0
+        self._wait_hint = False
+        self._second_hint = False
+
+    def update(self, *, cookie: str, challenged: bool, page_ok: bool) -> bool:
+        if challenged:
+            if self.captcha_seen and self.streak > 0 and not self._second_hint:
+                self._second_hint = True
+            self.captcha_seen = True
+            self.streak = 0
+            self._wait_hint = False
+            return False
+
+        ok = cookie_ready(cookie, challenged=False) and page_ok
+        if not ok:
+            self.streak = 0
+            return False
+
+        if self.captcha_seen and self.streak == 0 and not self._wait_hint:
+            self._wait_hint = True
+
+        need = STABLE_POLLS_AFTER_CAPTCHA if self.captcha_seen else STABLE_POLLS_NO_CAPTCHA
+        self.streak += 1
+        return self.streak >= need
+
+    def should_print_wait_hint(self) -> bool:
+        if self._wait_hint and self.streak == 1 and self.captcha_seen:
+            self._wait_hint = False
+            return True
+        return False
+
+    def should_print_second_hint(self) -> bool:
+        if self._second_hint:
+            self._second_hint = False
+            return True
+        return False
 
 
 def harvest_cookie_interactive(
@@ -67,13 +116,13 @@ def harvest_cookie_interactive(
     try_auto_solve: bool = False,
     quiet: bool = False,
 ) -> tuple[str, str]:
-    """Open Chrome; close only when no captcha or captcha solved."""
+    """Open Chrome; close only when captcha flow fully complete."""
     from seleniumbase import SB
 
     cookie = ""
     ua = ""
-    captcha_seen = False
     prompt_shown = False
+    tracker = StablePassTracker()
     if not quiet:
         print("\n>>> Opening Chrome...", flush=True)
 
@@ -95,16 +144,21 @@ def harvest_cookie_interactive(
             except Exception:
                 cookie = ua = ""
 
-            if cookie_ready(cookie, challenged=challenged) and page_passed_html(src):
+            page_ok = page_passed_html(src)
+            if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
                 break
 
             if challenged:
-                captcha_seen = True
                 if not prompt_shown:
                     prompt_shown = True
                     print(
                         "\n>>> Captcha detected — solve it in the Chrome window.\n"
-                        "    (Solve any sliders/checkboxes shown; window closes when done.)\n",
+                        "    (If a second captcha appears, solve that too.)\n",
+                        flush=True,
+                    )
+                elif tracker.should_print_second_hint() and not quiet:
+                    print(
+                        ">>> Another captcha step appeared — please solve it too.\n",
                         flush=True,
                     )
                 if try_auto_solve:
@@ -113,9 +167,12 @@ def harvest_cookie_interactive(
                     except Exception as e:
                         if not quiet:
                             print(f"[browser] auto-solve: {e}", file=sys.stderr)
-            elif cookie_ready(cookie, challenged=False):
-                break
-            elif not captcha_seen and time.monotonic() > fast_deadline:
+            elif tracker.should_print_wait_hint() and not quiet:
+                print(
+                    ">>> First captcha cleared — waiting a few seconds in case another appears...\n",
+                    flush=True,
+                )
+            elif not tracker.captcha_seen and time.monotonic() > fast_deadline:
                 if not quiet:
                     print(">>> Page did not load in time (no captcha seen).", flush=True)
                 break
