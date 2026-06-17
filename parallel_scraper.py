@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import re
 import sys
 import threading
 import time
@@ -34,6 +35,7 @@ from curl_cffi import requests
 import auto_refresh
 import bootstrap
 import canlii_scraper as cs
+import platform_util
 
 bootstrap.ensure_session_file()
 from session import HEADERS, COOKIE
@@ -73,28 +75,34 @@ class RateLimiter:
 
 
 class CookiePool:
-    """Queue of ready cookies; parallel background harvesters keep it full.
+    """Queue of ready cookies; background harvesters refill when low.
 
-    Multiple incognito Chrome windows can harvest at once. Workers grab a
-    cookie instantly from the queue on 403/429 — never retry with a burned one.
+  - macOS: up to 3 parallel AppleScript incognito harvests, pool kept ahead.
+  - Linux/Windows: one harvest at a time, lazy fill (avoids slow browser spam).
     """
 
     COOKIE_BUDGET = 75
     MIN_READY = 2
-    MAX_PARALLEL_HARVESTS = 3   # concurrent incognito / browser windows
     ACQUIRE_POLL = 0.02
     ACQUIRE_MAX_WAIT = 120
 
     def __init__(self, workers: int = 3):
         self._workers = max(1, workers)
-        self.TARGET_READY = max(self.MIN_READY, self._workers + 3)
+        if platform_util.is_linux() or platform_util.is_windows():
+            self.MAX_PARALLEL_HARVESTS = 1
+            self.TARGET_READY = max(1, min(self._workers, 2))
+            self._aggressive_prefetch = False
+        else:
+            self.MAX_PARALLEL_HARVESTS = 3
+            self.TARGET_READY = max(self.MIN_READY, self._workers + 3)
+            self._aggressive_prefetch = True
         self._ready: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
         self._harvests_lock = threading.Lock()
         self._active_harvests = 0
         self._harvest_serial = 0
         self._ready.put(COOKIE)
-        self.kick_fill()
+        # Never harvest on startup — avoids opening incognito while listing DBs.
         self._maintainer = threading.Thread(target=self._maintainer_loop, daemon=True, name="cookie-pool")
         self._maintainer.start()
 
@@ -138,10 +146,12 @@ class CookiePool:
                 ).start()
 
     def _maintainer_loop(self) -> None:
+        threshold = 1 if not self._aggressive_prefetch else self.TARGET_READY
+        poll = 0.5 if not self._aggressive_prefetch else 0.15
         while not self._stop.is_set():
-            if self._ready.qsize() < self.TARGET_READY:
+            if self._ready.qsize() < threshold:
                 self._start_harvests()
-            time.sleep(0.15)
+            time.sleep(poll)
 
     def ready_count(self) -> int:
         return self._ready.qsize()
@@ -150,15 +160,16 @@ class CookiePool:
         self._start_harvests()
 
     def acquire(self) -> str:
-        """Take a ready cookie; parallel harvesters refill while you wait."""
-        self.kick_fill()
+        """Take a ready cookie; harvesters refill when the pool runs low."""
         try:
             return self._ready.get_nowait()
         except queue.Empty:
             pass
+        self.kick_fill()
         deadline = time.monotonic() + self.ACQUIRE_MAX_WAIT
         while time.monotonic() < deadline and not self._stop.is_set():
-            self.kick_fill()
+            if self._ready.qsize() < (1 if not self._aggressive_prefetch else self.TARGET_READY):
+                self.kick_fill()
             try:
                 return self._ready.get(timeout=self.ACQUIRE_POLL)
             except queue.Empty:
@@ -209,19 +220,20 @@ def get_session(pool: CookiePool, force_new: bool = False) -> requests.Session:
 
 
 def worker_get(pool: CookiePool, limiter: RateLimiter, url: str, referer: str | None):
-    """One GET. On 403/captcha or 429: discard cookie and retry once with pool cookie."""
+    """One GET. On 429: brief backoff with same cookie before swapping."""
     headers = {"referer": referer} if referer else None
-    for cookie_try in range(2):
+    for attempt in range(4):
         s = get_session(pool)
         limiter.wait()
         try:
             r = s.get(url, headers=headers)
         except Exception:
-            if cookie_try == 0:
-                _swap_cookie(pool, reason="network error")
-                continue
-            raise
+            _swap_cookie(pool, reason="network error")
+            continue
         if r.status_code == 429:
+            if attempt < 2:
+                time.sleep(2.0)
+                continue
             _swap_cookie(pool, reason="429 rate limit")
             continue
         if cs._is_challenge(r):
@@ -245,7 +257,7 @@ def download_task(pool: CookiePool, limiter: RateLimiter, task: dict) -> tuple[d
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(r.content)
         _local.used = getattr(_local, "used", 0) + 1
-        if _local.used >= CookiePool.COOKIE_BUDGET - 15:
+        if _local.used >= CookiePool.COOKIE_BUDGET - 15 and pool._aggressive_prefetch:
             pool.kick_fill()
         return task, True, f"{len(r.content)//1024} KB"
     except NeedNewCookie:
@@ -371,15 +383,41 @@ def manager_get(pool: CookiePool, limiter: RateLimiter, url: str, referer: str |
     raise RuntimeError(f"Could not fetch {url}")
 
 
+def _pooled_discover_databases(pool: CookiePool, limiter: RateLimiter, juris: str) -> dict[str, str]:
+    """List databases using the cookie pool (swap on block)."""
+    r = manager_get(pool, limiter, f"{cs.BASE}/en/{juris}/")
+    return cs.parse_databases_html(r.text, juris)
+
+
+def _pooled_get_years(pool: CookiePool, limiter: RateLimiter, juris: str, db: str) -> list[int]:
+    cache = cs.OUT_ROOT / ".years_cache" / f"{juris}_{db}.json"
+    if cache.exists():
+        try:
+            return json.loads(cache.read_text())
+        except Exception:
+            pass
+    r = manager_get(
+        pool, limiter, f"{cs.BASE}/en/{juris}/{db}/", referer=f"{cs.BASE}/en/{juris}/",
+    )
+    years = sorted(
+        {int(y) for y in re.findall(rf"/{juris}/{db}/nav/date/(\d{{4}})", r.text)},
+        reverse=True,
+    )
+    if years:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(years))
+    return years
+
+
 def _scrape_juris(pool, limiter, juris, db_arg, args, grand) -> None:
     out = cs.OUT_ROOT
-    all_dbs = cs.discover_databases(get_session(pool), juris)
+    all_dbs = _pooled_discover_databases(pool, limiter, juris)
     targets = list(all_dbs.keys()) if db_arg == ["all"] else db_arg
     print(f"\n=== {juris} ({cs.JURISDICTIONS.get(juris, juris)}): {len(targets)} db(s) ===")
 
     for db in targets:
         print(f"\n[{juris}/{db}] {all_dbs.get(db, '?')}")
-        years_available = cs.get_years(get_session(pool), juris, db)
+        years_available = _pooled_get_years(pool, limiter, juris, db)
         years = cs.parse_years_arg(args.years, years_available)
         for year in years:
             if _year_complete(out, juris, db, year):
@@ -433,8 +471,10 @@ def main() -> int:
     ap.add_argument("--db", nargs="+", required=True, help="DB code(s) or 'all'")
     ap.add_argument("--years", default="all")
     ap.add_argument("--out", default="data")
-    ap.add_argument("--workers", type=int, default=3, help="Concurrent download workers (default 3)")
-    ap.add_argument("--rate", type=float, default=3.0, help="Max total requests/sec across all workers")
+    ap.add_argument("--workers", type=int, default=platform_util.default_workers(),
+                    help="Concurrent download workers")
+    ap.add_argument("--rate", type=float, default=platform_util.default_rate(),
+                    help="Max total requests/sec across all workers")
     args = ap.parse_args()
 
     cs.OUT_ROOT = Path(args.out)
@@ -442,7 +482,8 @@ def main() -> int:
     limiter = RateLimiter(args.rate)
 
     print(f"Cookie pool: target {pool.TARGET_READY} ready, up to "
-          f"{pool.MAX_PARALLEL_HARVESTS} parallel harvest windows.\n")
+          f"{pool.MAX_PARALLEL_HARVESTS} parallel harvest"
+          f"{' (lazy until needed)' if not pool._aggressive_prefetch else ''}.\n")
 
     jurisdictions = list(cs.JURISDICTIONS.keys()) if args.juris == "all" else [args.juris]
     grand = {"total": 0, "downloaded": 0, "failed": 0}

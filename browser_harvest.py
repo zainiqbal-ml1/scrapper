@@ -11,10 +11,16 @@ import time
 START_URL = "https://www.canlii.org/en/on/"
 PASS_TEXT = "Court of Appeal for Ontario"
 POLL_INTERVAL = 3
+POLL_INTERVAL_FAST = 0.4
 POLL_TRIES = 80  # ~4 minutes
 
 
-def harvest_cookie_interactive(*, try_auto_solve: bool = False, quiet: bool = False) -> tuple[str, str]:
+def harvest_cookie_interactive(
+    *,
+    try_auto_solve: bool = False,
+    quiet: bool = False,
+    fast_poll: bool = False,
+) -> tuple[str, str]:
     """Open Chrome, wait until CanLII loads, return (document.cookie, user_agent)."""
     from seleniumbase import SB
 
@@ -28,7 +34,8 @@ def harvest_cookie_interactive(*, try_auto_solve: bool = False, quiet: bool = Fa
         )
     with SB(uc=True, headed=True, locale="en") as sb:
         sb.activate_cdp_mode(START_URL)
-        sb.sleep(3)
+        sb.sleep(1 if fast_poll else 3)
+        poll = POLL_INTERVAL_FAST if fast_poll else POLL_INTERVAL
         for i in range(POLL_TRIES):
             try:
                 src = sb.cdp.get_page_source() or ""
@@ -48,7 +55,7 @@ def harvest_cookie_interactive(*, try_auto_solve: bool = False, quiet: bool = Fa
                 except Exception as e:
                     if i == 0:
                         print(f"[browser] auto-solve attempt: {e}", file=sys.stderr)
-            time.sleep(POLL_INTERVAL)
+            time.sleep(poll)
     if cookie and "datadome=" in cookie and not quiet:
         print(">>> Cookie captured from browser.\n", flush=True)
     return cookie.strip(), ua.strip()

@@ -33,7 +33,58 @@ CHALLENGE_JS = (
     "return (txt.includes('captcha')||txt.includes('proceed with our captcha')||html.includes('captcha-delivery'))?'1':'0';"
     "})()"
 )
+# Shorter poll when driven from Python (see harvest_cookie_macos).
+MAC_POLL_INTERVAL = 0.5
+MAC_POLL_TRIES = 120  # ~60s
 
+AS_OPEN = f'''
+tell application "Google Chrome"
+  set w to make new window with properties {{mode:"incognito"}}
+  set URL of active tab of w to "{START_URL}"
+end tell
+'''
+
+AS_POLL = f'''
+tell application "Google Chrome"
+  try
+    set t to active tab of front window
+    set c to execute t javascript "document.cookie"
+    set challenged to execute t javascript "{CHALLENGE_JS}"
+    return c & "|||" & challenged
+  on error
+    return "|||1"
+  end try
+end tell
+'''
+
+AS_ACTIVATE = '''
+tell application "Google Chrome"
+  activate
+  set index of front window to 1
+end tell
+'''
+
+AS_CLOSE = '''
+tell application "Google Chrome"
+  try
+    close front window
+  end try
+end tell
+'''
+
+
+def _run_as(script: str) -> str:
+    if not platform_util.has_osascript():
+        return ""
+    proc = subprocess.run(
+        ["osascript", "-e", script], text=True, capture_output=True
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+# Legacy single-shot script (kept for reference; harvest_cookie_macos uses AS_* above).
 APPLESCRIPT = '''
 tell application "Google Chrome"
   set w to make new window with properties {mode:"incognito"}
@@ -88,12 +139,42 @@ def run_applescript() -> str:
     return proc.stdout.strip()
 
 
-def harvest_cookie_macos() -> str:
-    """macOS-only: incognito via AppleScript (one window per call)."""
+def harvest_cookie_macos(*, quiet: bool = False) -> str:
+    """macOS: incognito via AppleScript, polled from Python for faster detection."""
     if not platform_util.has_osascript():
         return ""
-    print("[auto_refresh] macOS: opening incognito Chrome window...", flush=True)
-    cookie = run_applescript()
+    if not quiet:
+        print(
+            "\n>>> Opening Chrome incognito — solve the captcha if shown.\n"
+            "    (If this never finishes: Chrome menu View > Developer >\n"
+            "     Allow JavaScript from Apple Events)\n",
+            flush=True,
+        )
+    _run_as(AS_OPEN)
+    js_hint_shown = False
+    cookie = ""
+    for i in range(MAC_POLL_TRIES):
+        raw = _run_as(AS_POLL)
+        parts = (raw or "|||1").split("|||", 1)
+        cookie = parts[0].strip() if parts else ""
+        challenged = parts[1].strip() if len(parts) > 1 else "1"
+        if "datadome=" in cookie and challenged != "1":
+            break
+        if challenged == "1":
+            _run_as(AS_ACTIVATE)
+        elif i > 20 and not cookie and not js_hint_shown and not quiet:
+            print(
+                "    Tip: enable Chrome > View > Developer > "
+                "Allow JavaScript from Apple Events",
+                flush=True,
+            )
+            js_hint_shown = True
+        if not quiet and i > 0 and i % 20 == 0:
+            print(f"    still waiting... ({i * MAC_POLL_INTERVAL:.0f}s)", flush=True)
+        time.sleep(MAC_POLL_INTERVAL)
+    _run_as(AS_CLOSE)
+    if cookie and "datadome=" in cookie and not quiet:
+        print(">>> Cookie captured.\n", flush=True)
     return cookie.strip() if "datadome=" in cookie else ""
 
 
@@ -156,30 +237,42 @@ def _has_display() -> bool:
 
 
 def harvest_cookie_pool() -> str:
-    """Fast harvest for the background cookie pool (skip slow sb_mint).
-
-    Opens an incognito/browser window only. Safe to run several in parallel
-    (each call opens its own window).
-    """
+    """Fast harvest for the background cookie pool (skip slow sb_mint)."""
     global LAST_UA
     LAST_UA = ""
     if platform_util.has_osascript():
-        cookie = harvest_cookie_macos()
+        cookie = harvest_cookie_macos(quiet=True)
         if "datadome=" in cookie:
             return cookie
-    cookie, ua = browser_harvest.harvest_cookie_interactive(try_auto_solve=False, quiet=True)
+    if platform_util.is_linux():
+        try:
+            from linux_chrome_harvest import harvest_linux_fast
+
+            cookie, ua = harvest_linux_fast(quiet=True)
+            if "datadome=" in cookie:
+                LAST_UA = ua
+                return cookie
+        except Exception as e:
+            print(f"[auto_refresh] Linux fast harvest failed ({e}); using SeleniumBase.", file=sys.stderr)
+    cookie, ua = browser_harvest.harvest_cookie_interactive(
+        try_auto_solve=False, quiet=True, fast_poll=True,
+    )
     if "datadome=" in cookie:
         LAST_UA = ua
         return cookie
     return ""
 
 
-def harvest_cookie() -> str:
-    """Return a validated `document.cookie` string, or '' on failure."""
+def harvest_cookie(*, skip_auto_solve: bool = False) -> str:
+    """Return a validated `document.cookie` string, or '' on failure.
+
+    skip_auto_solve: go straight to incognito/browser (used by run.py so we
+    don't block ~30s on sb_mint before opening the window you need to solve).
+    """
     global LAST_UA
     LAST_UA = ""
 
-    can_auto = auto_solve_capable()
+    can_auto = False if skip_auto_solve else auto_solve_capable()
     if can_auto:
         try:
             import sb_mint

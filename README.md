@@ -44,6 +44,25 @@ sudo apt install xvfb
 xvfb-run python run.py
 ```
 
+### Linux performance
+
+Linux used to feel much slower than macOS because every cookie refresh launched a full SeleniumBase Chrome instance (30–60s+ each), and the pool tried to open several at startup.
+
+The scraper now:
+
+- Uses **system Chrome** for cookie harvest on Linux (faster than SeleniumBase UC).
+- **Lazy cookie pool** — only opens a browser when a cookie is actually needed (one at a time).
+- **429 backoff** — waits 2s with the same cookie before swapping (avoids unnecessary harvests).
+- Defaults to **4 workers** and **4 req/s** on Linux (press Enter at the prompts to accept).
+
+If downloads are still slow, try raising throughput (if your IP tolerates it):
+
+```bash
+python run.py --juris on --db onca --years 2024 --workers 6 --rate 6
+```
+
+If downloads stall after solving captcha, enable **Chrome > View > Developer > Allow JavaScript from Apple Events** (required for automatic cookie capture on macOS).
+
 ## Run
 
 Interactive (recommended):
@@ -85,7 +104,7 @@ python auto_refresh.py
 ## How it works
 
 - Downloads use `curl_cffi` with Chrome TLS impersonation and a `datadome` cookie.
-- When cookies expire, a **cookie pool** opens background Chrome windows (up to 3 in parallel) to harvest new ones while downloads continue.
+- When cookies expire, a **cookie pool** harvests new ones in the background (macOS: up to 3 AppleScript windows; Linux: one system-Chrome window at a time).
 - Existing PDFs and completed years are skipped on resume.
 - Failed downloads are retried until they succeed.
 

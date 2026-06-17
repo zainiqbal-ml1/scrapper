@@ -29,4 +29,16 @@ def harvest_backend() -> str:
     """Human-readable label for which harvest path will be used."""
     if is_macos() and has_osascript():
         return "macOS (AppleScript + SeleniumBase fallback)"
-    return "SeleniumBase browser (Linux/Windows or no osascript)"
+    if is_linux():
+        return "Linux (system Chrome fast harvest + SeleniumBase fallback)"
+    return "SeleniumBase browser (Windows or no osascript)"
+
+
+def default_workers() -> int:
+    """Sensible parallel worker count for this OS."""
+    return 4 if is_linux() else 1
+
+
+def default_rate() -> float:
+    """Sensible requests/sec cap for this OS."""
+    return 4.0 if is_linux() else 2.0

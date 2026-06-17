@@ -176,7 +176,12 @@ def fetch(session: requests.Session, url: str, *, tries: int = 5, referer: str |
 def discover_databases(session: requests.Session, juris: str) -> dict[str, str]:
     """All database codes -> names within a jurisdiction (from its landing page)."""
     r = fetch(session, f"{BASE}/en/{juris}/")
-    pairs = re.findall(rf'<a class="canlii" href="/{juris}/([a-z0-9]+)">([^<]+)</a>', r.text)
+    return parse_databases_html(r.text, juris)
+
+
+def parse_databases_html(html: str, juris: str) -> dict[str, str]:
+    """Parse database links from a jurisdiction landing page."""
+    pairs = re.findall(rf'<a class="canlii" href="/{juris}/([a-z0-9]+)">([^<]+)</a>', html)
     dbs: dict[str, str] = {}
     for code, name in pairs:
         dbs.setdefault(code, name.strip())

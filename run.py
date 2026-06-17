@@ -47,43 +47,62 @@ def _reload_session() -> None:
 def refresh_until_valid() -> bool:
     """Refresh the session until --check passes. No curl.txt; solve in window."""
     while True:
-        cookie = auto_refresh.harvest_cookie()
+        cookie = auto_refresh.harvest_cookie(skip_auto_solve=True)
         if cookie:
             auto_refresh.update_session_cookie(cookie, getattr(auto_refresh, "LAST_UA", ""))
             _reload_session()
             if subprocess.call([sys.executable, "canlii_scraper.py", "--check"]) == 0:
                 return True
+            print("Cookie captured but session check still failed — trying again...", flush=True)
         try:
-            input("\nSession still blocked. A window will open - SOLVE THE SLIDER, "
+            input("\nSession still blocked. Solve the captcha in Chrome, "
                   "then press Enter to retry (Ctrl+C to quit)... ")
         except (KeyboardInterrupt, EOFError):
             return False
 
 
+def ensure_session_or_refresh() -> bool:
+    """Validate session before network calls; refresh first if blocked."""
+    if subprocess.call(
+        [sys.executable, "canlii_scraper.py", "--check"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ) == 0:
+        return True
+    print("\nSession needs a fresh cookie before listing databases.")
+    print("A Chrome incognito window will open — solve the captcha if shown.\n")
+    return refresh_until_valid()
+
+
 def _discover_dbs_with_refresh(juris: str) -> dict:
     """Fetch the database list for a jurisdiction, refreshing if blocked."""
+    if not ensure_session_or_refresh():
+        raise KeyboardInterrupt()
     while True:
         session = cs.make_session()
         try:
+            print(f"Listing databases for {juris}...", flush=True)
             return cs.discover_databases(session, juris)
         except cs.SessionExpired:
-            print("\nSession blocked while listing databases - refreshing first...")
+            print("\nSession blocked while listing databases — refreshing...")
             if not refresh_until_valid():
                 raise
-            print("Session refreshed. Listing databases...\n")
+            print("Session refreshed. Retrying...\n")
 
 
 def select_workers_rate() -> tuple[int, float]:
     """Ask how many parallel workers and the max requests/second."""
-    raw = input("Parallel workers [1]: ").strip()
-    workers = int(raw) if raw.isdigit() and int(raw) >= 1 else 1
-    raw = input("Max requests/second [2]: ").strip()
+    dw = platform_util.default_workers()
+    dr = platform_util.default_rate()
+    raw = input(f"Parallel workers [{dw}]: ").strip()
+    workers = int(raw) if raw.isdigit() and int(raw) >= 1 else dw
+    raw = input(f"Max requests/second [{dr:g}]: ").strip()
     try:
-        rate = float(raw) if raw else 2.0
+        rate = float(raw) if raw else dr
     except ValueError:
-        rate = 2.0
+        rate = dr
     if rate <= 0:
-        rate = 2.0
+        rate = dr
     return workers, rate
 
 
@@ -136,8 +155,8 @@ def main() -> int:
         # Non-interactive: read selection from flags (sensible defaults).
         juris = _extract_opt(args, "--juris", str, "on")
         years = _extract_opt(args, "--years", str, "all")
-        workers = _extract_opt(args, "--workers", int, 1)
-        rate = _extract_opt(args, "--rate", float, 2.0)
+        workers = _extract_opt(args, "--workers", int, platform_util.default_workers())
+        rate = _extract_opt(args, "--rate", float, platform_util.default_rate())
         if "--db" not in args:
             print("Provide --db <code...|all> (or run 'python run.py' for interactive mode).")
             return 1
