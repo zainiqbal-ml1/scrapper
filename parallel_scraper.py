@@ -97,7 +97,7 @@ class CookiePool:
         self._harvesting = threading.Event()
         self._need_fill = threading.Event()
         self._stop = threading.Event()
-        self._ready.put(COOKIE)
+        # Pool holds spare cookies only; the live session cookie comes from session.py.
         self._need_fill.set()
         self._thread = threading.Thread(target=self._maintainer, daemon=True, name="cookie-pool")
         self._thread.start()
@@ -159,6 +159,7 @@ class CookiePool:
             return cookie
         except queue.Empty:
             pass
+        print("    (cookie pool empty — waiting for harvest...)", flush=True)
         self.kick_fill()
         deadline = time.monotonic() + self.ACQUIRE_MAX_WAIT
         while time.monotonic() < deadline:
@@ -168,6 +169,7 @@ class CookiePool:
                 return cookie
             except queue.Empty:
                 continue
+        print("    (pool still empty — opening browser for a fresh cookie...)", flush=True)
         cookie = self._harvest()
         self.kick_fill()
         return cookie
@@ -184,15 +186,19 @@ def get_session(pool: CookiePool, force_new: bool = False) -> requests.Session:
     used = getattr(_local, "used", 0)
     if not force_new and used >= CookiePool.COOKIE_BUDGET:
         force_new = True
-    if force_new or not getattr(_local, "session", None):
-        if force_new and used:
-            print(f"    (cookie swap after {used} downloads)", flush=True)
+    if not force_new and getattr(_local, "session", None):
+        return _local.session
+    if force_new and used:
+        print(f"    (cookie swap after {used} downloads)", flush=True)
+    if force_new:
         cookie = pool.acquire()
-        _local.session = requests.Session(
-            impersonate=cs.IMPERSONATE, headers=HEADERS,
-            cookies=parse_cookie(cookie), timeout=60,
-        )
-        _local.used = 0
+    else:
+        cookie = COOKIE  # first use: session.py cookie, do not drain the pool
+    _local.session = requests.Session(
+        impersonate=cs.IMPERSONATE, headers=HEADERS,
+        cookies=parse_cookie(cookie), timeout=60,
+    )
+    _local.used = 0
     return _local.session
 
 
@@ -200,12 +206,16 @@ def worker_get(pool: CookiePool, limiter: RateLimiter, url: str, referer: str | 
     """One GET with rate limiting. 429/block -> NeedNewCookie (swap via download_task)."""
     s = get_session(pool)
     headers = {"referer": referer} if referer else None
+    net_err = 0
     while True:
         limiter.wait()
         try:
             r = s.get(url, headers=headers)
         except Exception:
-            time.sleep(0.3)
+            net_err += 1
+            if net_err >= 5:
+                raise NeedNewCookie()
+            time.sleep(0.5)
             continue
         if r.status_code == 429 or cs._is_challenge(r):
             raise NeedNewCookie()
@@ -381,6 +391,7 @@ def _scrape_juris(pool, limiter, juris, db_arg, args, grand) -> None:
             if _year_complete(out, juris, db, year):
                 print(f"  {juris}/{db}/{year}: already complete, skipping")
                 continue
+            print(f"  {juris}/{db}/{year}: fetching decision list...", flush=True)
             r = manager_get(pool, limiter, f"{cs.BASE}/{juris}/{db}/nav/date/{year}/items",
                             referer=f"{cs.BASE}/en/{juris}/{db}/")
             try:
@@ -388,7 +399,9 @@ def _scrape_juris(pool, limiter, juris, db_arg, args, grand) -> None:
             except Exception:
                 items = []
             if not items:
+                print(f"  {juris}/{db}/{year}: no items, skipping")
                 continue
+            print(f"  {juris}/{db}/{year}: {len(items)} decisions — downloading...", flush=True)
 
             year_dir = out / juris / db / str(year)
             records, tasks = [], []
