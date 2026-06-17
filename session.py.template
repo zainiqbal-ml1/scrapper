@@ -1,0 +1,46 @@
+"""Browser session config copied from the user's real Chrome (Copy as cURL).
+
+On a new machine this file is copied to session.py automatically.
+Refresh a live session by running:  python run.py
+(or paste Copy-as-cURL into curl.txt and run:  python set_session.py)
+"""
+
+COOKIE = (
+    "cookieConsent=ALL"
+)
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+)
+
+# Full Chrome header set (incl. client hints) so DataDome treats us like the
+# real browser and keeps rotating the `datadome` cookie instead of throttling.
+HEADERS = {
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "accept-language": "en-US,en;q=0.9",
+    "sec-ch-device-memory": "8",
+    "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+    "sec-ch-ua-arch": '"arm"',
+    "sec-ch-ua-full-version-list": '"Google Chrome";v="149.0.7827.54", "Chromium";v="149.0.7827.54", "Not)A;Brand";v="24.0.0.0"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-model": '""',
+    "sec-ch-ua-platform": '"macOS"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1",
+    "user-agent": USER_AGENT,
+}
+
+
+def cookies_dict() -> dict:
+    """Parse COOKIE string into a dict so curl_cffi manages it as a jar
+    (lets DataDome rotate the `datadome` cookie via Set-Cookie)."""
+    jar = {}
+    for part in COOKIE.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            jar[k.strip()] = v.strip()
+    return jar

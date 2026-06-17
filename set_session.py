@@ -16,6 +16,8 @@ import re
 import sys
 from pathlib import Path
 
+import bootstrap
+
 CURL_FILE = Path("curl.txt")
 SESSION_FILE = Path("session.py")
 
@@ -44,6 +46,7 @@ def extract(curl: str) -> tuple[str, str]:
 
 
 def main() -> int:
+    bootstrap.ensure_session_file()
     if not CURL_FILE.exists():
         sys.exit(f"ERROR: paste your 'Copy as cURL' into {CURL_FILE.resolve()} first.")
     curl = CURL_FILE.read_text()

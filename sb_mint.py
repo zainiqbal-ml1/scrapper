@@ -23,6 +23,8 @@ import re
 import sys
 from pathlib import Path
 
+import bootstrap
+
 SESSION_FILE = Path("session.py")
 COOKIE_STATE = Path(".cookie_state.json")
 START_URL = "https://www.canlii.org/en/on/"
@@ -91,6 +93,7 @@ def harvest_cookie() -> str:
 def update_session(cookie: str, ua: str = "") -> None:
     """Write the cookie (and matching UA, if captured) into session.py and
     clear the stale rotated-cookie cache so curl_cffi starts fresh."""
+    bootstrap.ensure_session_file()
     src = SESSION_FILE.read_text()
     src = re.sub(
         r'COOKIE = \(\s*"[^"]*"\s*\)',

@@ -22,6 +22,8 @@ import sys
 import time
 from pathlib import Path
 
+import bootstrap
+
 SESSION_FILE = Path("session.py")
 COOKIE_STATE = Path(".cookie_state.json")
 AUTO_CAP_CACHE = Path(".auto_solve_capable")
@@ -146,6 +148,7 @@ def harvest_cookie() -> str:
 
 
 def update_session_cookie(cookie: str, ua: str = "") -> None:
+    bootstrap.ensure_session_file()
     src = SESSION_FILE.read_text()
     src = re.sub(r'COOKIE = \(\s*"[^"]*"\s*\)', f'COOKIE = (\n    "{cookie}"\n)', src, count=1, flags=re.S)
     if ua:

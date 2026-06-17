@@ -19,6 +19,9 @@ Non-interactive (pass everything):
 import subprocess
 import sys
 
+import bootstrap
+bootstrap.ensure_session_file()
+
 import canlii_scraper as cs
 import auto_refresh
 

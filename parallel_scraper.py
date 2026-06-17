@@ -33,7 +33,10 @@ from pathlib import Path
 from curl_cffi import requests
 
 import auto_refresh
+import bootstrap
 import canlii_scraper as cs
+
+bootstrap.ensure_session_file()
 from session import HEADERS, COOKIE
 
 

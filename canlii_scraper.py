@@ -43,6 +43,8 @@ from pathlib import Path
 
 from curl_cffi import requests
 
+import bootstrap
+bootstrap.ensure_session_file()
 from session import HEADERS, cookies_dict
 
 BASE = "https://www.canlii.org"
