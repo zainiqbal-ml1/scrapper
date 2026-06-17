@@ -50,6 +50,7 @@ from session import HEADERS, cookies_dict
 BASE = "https://www.canlii.org"
 IMPERSONATE = "chrome146"
 OUT_ROOT = Path("data")
+CHECK_TIMEOUT = 20  # fast session probe (don't block the interactive menu)
 
 # CanLII jurisdictions ("states"): code -> display name. This set is stable
 # (Canada's federal + provinces/territories), so we don't need a live fetch to
@@ -117,11 +118,23 @@ def make_session() -> requests.Session:
 
 
 def check_session(juris: str = "on") -> bool:
-    """True when the session can load a jurisdiction landing page."""
+    """True when the session can load a jurisdiction landing page (fast, ~20s max)."""
+    cookies = _load_cookies()
+    if "datadome" not in cookies:
+        return False
     try:
-        discover_databases(make_session(), juris)
-        return True
-    except SessionExpired:
+        session = requests.Session(
+            impersonate=IMPERSONATE,
+            headers=HEADERS,
+            cookies=_load_cookies(),
+            timeout=CHECK_TIMEOUT,
+        )
+        r = session.get(f"{BASE}/en/{juris}/")
+        if _is_challenge(r) or r.status_code != 200:
+            return False
+        dbs = parse_databases_html(r.text, juris)
+        return bool(dbs)
+    except Exception:
         return False
 
 

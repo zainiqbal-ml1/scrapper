@@ -45,25 +45,36 @@ def _reload_session() -> None:
 
 
 def refresh_until_valid(juris: str) -> bool:
-    """Refresh the session until check_session passes. One browser window only."""
-    print("\nOpening ONE Chrome incognito window — solve the captcha if shown.\n", flush=True)
-    cookie = auto_refresh.harvest_cookie_macos(keep_open=True)
+    """Refresh the session until check_session passes."""
+    print("\nSession blocked — need a fresh cookie.\n", flush=True)
+    cookie = ""
+    if platform_util.has_osascript() and platform_util.chrome_macos_installed():
+        cookie = auto_refresh.harvest_cookie_macos(keep_open=True, quick=True)
+    if not cookie:
+        cookie = auto_refresh.poll_incognito_windows()
+    if not cookie:
+        print("Opening browser via SeleniumBase (works when AppleScript cannot control Chrome)...\n", flush=True)
+        cookie = auto_refresh.harvest_cookie_browser()
     while True:
-        if not cookie:
-            cookie = auto_refresh.poll_incognito_windows()
         if cookie and "datadome=" in cookie:
             auto_refresh.update_session_cookie(cookie, getattr(auto_refresh, "LAST_UA", ""))
             _reload_session()
+            print("Verifying session...", flush=True)
             if cs.check_session(juris):
                 print("Session OK.\n", flush=True)
                 return True
-            print("Cookie saved but CanLII still blocked — try solving again.", flush=True)
+            print("Cookie saved but CanLII still blocked for this jurisdiction.", flush=True)
+            cookie = ""
         try:
-            input("\nSolve the captcha in that Chrome window, then press Enter "
-                  "(Ctrl+C to quit)... ")
+            input(
+                "\nSolve the captcha in the Chrome window, then press Enter "
+                "(Ctrl+C to quit)... "
+            )
         except (KeyboardInterrupt, EOFError):
             return False
         cookie = auto_refresh.poll_incognito_windows()
+        if not cookie:
+            cookie = auto_refresh.harvest_cookie_browser()
 
 
 def ensure_session_or_refresh(juris: str) -> bool:
@@ -115,6 +126,7 @@ def interactive_select():
     Returns (juris, db_list, years, workers, rate).
     """
     juris = cs.select_jurisdiction()
+    print(flush=True)  # newline after selection so status line is visible
     if juris == "all":
         years = cs.select_years()
         workers, rate = select_workers_rate()

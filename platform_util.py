@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import platform
 import shutil
+from pathlib import Path
 
 
 def system() -> str:
@@ -23,6 +24,11 @@ def is_windows() -> bool:
 
 def has_osascript() -> bool:
     return is_macos() and shutil.which("osascript") is not None
+
+
+def chrome_macos_installed() -> bool:
+    """True when Google Chrome.app is present (AppleScript harvest needs this)."""
+    return Path("/Applications/Google Chrome.app").exists()
 
 
 def harvest_backend() -> str:

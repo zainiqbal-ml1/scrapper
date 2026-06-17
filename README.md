@@ -63,6 +63,8 @@ python run.py --juris on --db onca --years 2024 --workers 6 --rate 6
 
 If downloads stall after solving captcha, enable **Chrome > View > Developer > Allow JavaScript from Apple Events** (required for automatic cookie capture on macOS).
 
+Also allow **Terminal/Cursor to control Google Chrome** when macOS prompts (System Settings > Privacy & Security > Automation). Without this, the scraper falls back to SeleniumBase — a visible Chrome window you solve manually.
+
 ## Run
 
 Interactive (recommended):

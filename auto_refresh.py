@@ -95,13 +95,16 @@ return ""
 _harvest_lock = threading.Lock()
 
 
-def _run_as(script: str) -> str:
+def _run_as(script: str, *, quiet: bool = False) -> str:
     if not platform_util.has_osascript():
         return ""
     proc = subprocess.run(
         ["osascript", "-e", script], text=True, capture_output=True
     )
     if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        if err and not quiet:
+            print(f"[osascript] {err}", file=sys.stderr, flush=True)
         return ""
     return proc.stdout.strip()
 
@@ -171,45 +174,68 @@ def poll_incognito_windows(*, quiet: bool = False) -> str:
     return cookie if "datadome=" in cookie else ""
 
 
-def harvest_cookie_macos(*, quiet: bool = False, keep_open: bool = False) -> str:
-    """macOS: one incognito window, poll that exact window index."""
+def harvest_cookie_macos(
+    *,
+    quiet: bool = False,
+    keep_open: bool = False,
+    quick: bool = False,
+) -> str:
+    """macOS: one incognito window, poll that exact window index.
+
+    quick: only poll ~8s (used with keep_open so the user gets a prompt fast).
+    """
     if not platform_util.has_osascript():
+        return ""
+    if not platform_util.chrome_macos_installed():
+        if not quiet:
+            print(
+                "Google Chrome not found in /Applications.\n"
+                "  Install Chrome or the scraper will use SeleniumBase instead.\n",
+                flush=True,
+            )
         return ""
     with _harvest_lock:
         if not quiet:
             print(
                 "\n>>> Opening Chrome incognito — solve the captcha if shown.\n"
-                "    (If this never finishes: Chrome menu View > Developer >\n"
-                "     Allow JavaScript from Apple Events)\n",
+                "    Allow Terminal/Cursor to control Chrome if macOS asks.\n"
+                "    (Also: Chrome > View > Developer > Allow JavaScript from Apple Events)\n",
                 flush=True,
             )
-        raw_idx = _run_as(AS_OPEN).strip()
+        raw_idx = _run_as(AS_OPEN, quiet=quiet).strip()
         if not raw_idx.isdigit():
+            if not quiet:
+                print(
+                    "Could not open Chrome via AppleScript "
+                    "(check Automation permission in System Settings > Privacy).\n",
+                    flush=True,
+                )
             return poll_incognito_windows(quiet=quiet)
         win_idx = int(raw_idx)
         js_hint_shown = False
         cookie = ""
-        for i in range(MAC_POLL_TRIES):
-            raw = _run_as(_as_poll_window(win_idx))
+        max_iters = 16 if (keep_open or quick) else MAC_POLL_TRIES
+        for i in range(max_iters):
+            raw = _run_as(_as_poll_window(win_idx), quiet=True)
             parts = (raw or "|||1").split("|||", 1)
             cookie = parts[0].strip() if parts else ""
             challenged = parts[1].strip() if len(parts) > 1 else "1"
             if "datadome=" in cookie and challenged != "1":
                 break
             if challenged == "1":
-                _run_as(AS_ACTIVATE_WINDOW % win_idx)
-            elif i > 10 and not cookie and not js_hint_shown and not quiet:
+                _run_as(AS_ACTIVATE_WINDOW % win_idx, quiet=True)
+            elif i > 6 and not cookie and not js_hint_shown and not quiet:
                 print(
                     "    Tip: enable Chrome > View > Developer > "
                     "Allow JavaScript from Apple Events",
                     flush=True,
                 )
                 js_hint_shown = True
-            if not quiet and i > 0 and i % 20 == 0:
+            if not quiet and i > 0 and i % 10 == 0:
                 print(f"    still waiting... ({i * MAC_POLL_INTERVAL:.0f}s)", flush=True)
             time.sleep(MAC_POLL_INTERVAL)
         if "datadome=" in cookie or not keep_open:
-            _run_as(AS_CLOSE_WINDOW % win_idx)
+            _run_as(AS_CLOSE_WINDOW % win_idx, quiet=True)
     if cookie and "datadome=" in cookie and not quiet:
         print(">>> Cookie captured.\n", flush=True)
     return cookie.strip() if "datadome=" in cookie else ""
