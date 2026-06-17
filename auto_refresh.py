@@ -97,18 +97,13 @@ end tell
 
 
 def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None) -> str:
-    """macOS: incognito window, auto-capture cookie, close when done.
-
-    Only brings the window to front if a captcha is actually shown.
-    If CanLII loads with no captcha, captures and closes within seconds.
-    """
+    """macOS: incognito window; close only when no captcha or captcha solved."""
     global LAST_MAC_NOJS
     LAST_MAC_NOJS = False
     if not platform_util.has_osascript() or not platform_util.chrome_macos_installed():
         LAST_MAC_NOJS = True
         return ""
 
-    max_wait = timeout_s or browser_harvest.CAPTCHA_TIMEOUT
     with _harvest_lock:
         if not quiet:
             print("\n>>> Opening Chrome incognito...", flush=True)
@@ -133,10 +128,16 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
         passed = False
         captcha_seen = False
         activated = False
-        deadline = time.monotonic() + max_wait
+        prompt_shown = False
         fast_deadline = time.monotonic() + browser_harvest.FAST_EXIT_NO_CAPTCHA
+        # timeout_s only applies when no captcha appears; captcha waits until solved.
+        no_captcha_deadline = (
+            time.monotonic() + (timeout_s or browser_harvest.FAST_EXIT_NO_CAPTCHA)
+            if timeout_s
+            else fast_deadline
+        )
 
-        while time.monotonic() < deadline:
+        while True:
             raw = _run_as(_as_poll(win_idx), quiet=True)
             cookie, passed, challenged = browser_harvest.parse_poll(raw)
             if passed and "datadome=" in cookie:
@@ -146,17 +147,20 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
                 if not activated:
                     _run_as(AS_ACTIVATE % win_idx, quiet=True)
                     activated = True
-                    if not quiet:
-                        print(
-                            ">>> Captcha detected — solve the slider in Chrome.\n"
-                            "    (Window closes automatically when you pass.)\n",
-                            flush=True,
-                        )
-            elif not captcha_seen and time.monotonic() > fast_deadline:
+                if not prompt_shown:
+                    prompt_shown = True
+                    print(
+                        ">>> Captcha detected — solve the slider in Chrome.\n"
+                        "    (Window stays open until you pass; closes automatically after.)\n",
+                        flush=True,
+                    )
+            elif not captcha_seen and time.monotonic() > no_captcha_deadline:
                 break
             time.sleep(MAC_POLL_INTERVAL)
 
-        _run_as(AS_CLOSE % win_idx, quiet=True)
+        # Close only on success or when no captcha ever appeared.
+        if passed or not captcha_seen:
+            _run_as(AS_CLOSE % win_idx, quiet=True)
 
     if passed and cookie and "datadome=" in cookie:
         if not quiet:
@@ -228,7 +232,8 @@ def harvest_cookie_pool(*, quiet: bool = False) -> str:
     global LAST_UA
     LAST_UA = ""
     if platform_util.has_osascript() and platform_util.apple_events_works():
-        cookie = harvest_cookie_macos(quiet=True, timeout_s=60)
+        # No short timeout — if captcha appears, wait until the user solves it.
+        cookie = harvest_cookie_macos(quiet=quiet)
         if "datadome=" in cookie:
             return cookie
     if platform_util.is_linux():
@@ -247,20 +252,9 @@ def harvest_cookie_pool(*, quiet: bool = False) -> str:
 
 
 def harvest_cookie() -> str:
-    """Harvest a validated cookie: auto-solve -> AppleScript -> SeleniumBase."""
+    """Harvest a validated cookie: AppleScript -> manual browser -> auto-solve last."""
     global LAST_UA
     LAST_UA = ""
-
-    if auto_solve_capable():
-        try:
-            import sb_mint
-
-            cookie = sb_mint.harvest_cookie()
-            if "datadome=" in cookie:
-                LAST_UA = sb_mint.LAST_UA
-                return cookie.strip()
-        except Exception as e:
-            print(f"[auto_refresh] Auto-solve failed ({e}); trying browser.", file=sys.stderr)
 
     if platform_util.has_osascript() and platform_util.chrome_macos_installed():
         ae_cache = platform_util.APPLE_EVENTS_CACHE
@@ -272,7 +266,28 @@ def harvest_cookie() -> str:
             if not LAST_MAC_NOJS:
                 return ""
 
-    return harvest_cookie_browser(try_auto=auto_solve_capable())
+    # Manual browser path — window stays open until captcha solved (no auto-solve needed).
+    cookie = harvest_cookie_browser(try_auto=False)
+    if "datadome=" in cookie:
+        return cookie
+
+    # Optional auto-solve only when Screen Recording + Accessibility are granted.
+    if auto_solve_capable():
+        try:
+            import sb_mint
+
+            cookie = sb_mint.harvest_cookie()
+            if "datadome=" in cookie:
+                LAST_UA = sb_mint.LAST_UA
+                return cookie.strip()
+        except Exception as e:
+            print(f"[auto_refresh] Auto-solve failed ({e}).", file=sys.stderr)
+        try:
+            AUTO_CAP_CACHE.write_text(json.dumps(False))
+        except Exception:
+            pass
+
+    return ""
 
 
 def update_session_cookie(cookie: str, ua: str = "") -> None:

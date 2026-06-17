@@ -1,8 +1,8 @@
 """Cross-platform cookie harvest via a real Chrome window (SeleniumBase).
 
 Shared pass/captcha detection used by AppleScript and SeleniumBase paths.
-Window closes automatically once the cookie is captured (or on timeout).
-Only prompts for manual captcha solve when a captcha is actually shown.
+Window closes only when CanLII loads with no captcha, or after captcha is solved.
+If a captcha is shown, the window stays open until the user passes it.
 """
 from __future__ import annotations
 
@@ -11,9 +11,7 @@ import time
 
 START_URL = "https://www.canlii.org/en/on/"
 POLL_INTERVAL = 0.4
-FAST_EXIT_NO_CAPTCHA = 12   # seconds: if no captcha ever shown, give up waiting
-CAPTCHA_TIMEOUT = 180       # seconds: max wait once captcha is shown
-DEFAULT_TIMEOUT = 180
+FAST_EXIT_NO_CAPTCHA = 15   # seconds: give up only when no captcha ever appeared
 
 # One JS snippet for AppleScript + CDP: "cookie|||passed|||challenged"
 POLL_JS = (
@@ -58,33 +56,43 @@ def page_challenged_html(src: str) -> bool:
     )
 
 
+def _captcha_prompt_once(*, quiet: bool, shown: list[bool]) -> None:
+    if quiet or shown[0]:
+        return
+    shown[0] = True
+    print(
+        "\n>>> Captcha detected — solve the slider in the Chrome window.\n"
+        "    (Window stays open until you pass; closes automatically after.)\n",
+        flush=True,
+    )
+
+
 def harvest_cookie_interactive(
     *,
     try_auto_solve: bool = False,
     quiet: bool = False,
-    timeout_s: float = DEFAULT_TIMEOUT,
 ) -> tuple[str, str]:
-    """Open Chrome, capture cookie when CanLII loads, close automatically."""
+    """Open Chrome; close only when no captcha or captcha solved."""
     from seleniumbase import SB
 
     cookie = ""
     ua = ""
     captcha_seen = False
+    prompt_shown = [False]
     if not quiet:
         print("\n>>> Opening Chrome...", flush=True)
 
-    deadline = time.monotonic() + timeout_s
     fast_deadline = time.monotonic() + FAST_EXIT_NO_CAPTCHA
 
     with SB(uc=True, headed=True, locale="en") as sb:
         sb.activate_cdp_mode(START_URL)
         sb.sleep(1.5)
-        while time.monotonic() < deadline:
+        while True:
             try:
                 src = sb.cdp.get_page_source() or ""
             except Exception:
                 src = ""
-            challenged = page_challenged_html(src)
+
             if page_passed_html(src):
                 try:
                     cookie = sb.cdp.evaluate("document.cookie") or ""
@@ -93,14 +101,11 @@ def harvest_cookie_interactive(
                     cookie = ua = ""
                 if "datadome=" in cookie:
                     break
+
+            challenged = page_challenged_html(src)
             if challenged:
                 captcha_seen = True
-                if not quiet:
-                    print(
-                        "\n>>> Captcha detected — solve the slider in the Chrome window.\n"
-                        "    (Closes automatically once you pass.)\n",
-                        flush=True,
-                    )
+                _captcha_prompt_once(quiet=quiet, shown=prompt_shown)
                 if try_auto_solve:
                     try:
                         sb.cdp.solve_captcha()
@@ -109,8 +114,9 @@ def harvest_cookie_interactive(
                             print(f"[browser] auto-solve: {e}", file=sys.stderr)
             elif not captcha_seen and time.monotonic() > fast_deadline:
                 if not quiet:
-                    print(">>> Page did not load in time.", flush=True)
+                    print(">>> Page did not load in time (no captcha seen).", flush=True)
                 break
+
             time.sleep(POLL_INTERVAL)
 
     if cookie and "datadome=" in cookie and not quiet:

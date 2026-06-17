@@ -1,21 +1,9 @@
 #!/usr/bin/env python3
 """Automated CanLII cookie minter using SeleniumBase CDP (stealth) mode.
 
-Unlike auto_refresh.py (which needs you to solve the slider by hand), this
-solves the DataDome slider AUTOMATICALLY via SeleniumBase's built-in
-`solve_captcha()` (it drives a real mouse drag through PyAutoGUI).
-
-IMPORTANT - macOS permissions (one-time, needs admin):
-  System Settings > Privacy & Security >
-    - Screen Recording   -> enable for your Terminal / IDE
-    - Accessibility      -> enable for your Terminal / IDE
-  Without BOTH, the slider drag silently fails (PyAutoGUI can't move the mouse
-  or read the screen). On a managed Mac without admin, use auto_refresh.py
-  instead and solve the slider yourself.
-
-Usage:
-    python sb_mint.py            # mint once, write session.py, exit 0/1
-    from sb_mint import harvest_cookie   # returns validated cookie string
+Tries auto-solve when Screen Recording + Accessibility are granted.
+Otherwise (or if auto-solve fails) keeps Chrome open until you solve the
+slider manually — window closes only after pass or when no captcha appears.
 """
 from __future__ import annotations
 
@@ -30,19 +18,23 @@ import browser_harvest
 SESSION_FILE = Path("session.py")
 COOKIE_STATE = Path(".cookie_state.json")
 START_URL = browser_harvest.START_URL
-SOLVE_ATTEMPTS = 6      # each attempt: solve_captcha() + wait
-WAIT_PER_ATTEMPT = 4    # seconds
+SOLVE_ATTEMPTS = 6
+WAIT_PER_ATTEMPT = 4
 
-# Module-level scratch so callers can read the UA that came with the cookie.
 LAST_UA = ""
 
 
 def _mint() -> tuple[str, str]:
-    """Launch stealth Chrome, auto-solve the slider, return (cookie, user_agent)."""
+    """Launch stealth Chrome; close only when no captcha or captcha solved."""
     from seleniumbase import SB
 
     cookie = ""
     ua = ""
+    captcha_seen = False
+    prompt_shown = False
+    auto_attempts = 0
+    fast_deadline = time.monotonic() + browser_harvest.FAST_EXIT_NO_CAPTCHA
+
     with SB(uc=True, headed=True, locale="en") as sb:
         sb.activate_cdp_mode(START_URL)
         sb.sleep(2)
@@ -53,42 +45,44 @@ def _mint() -> tuple[str, str]:
             except Exception:
                 return ""
 
-        captcha_seen = False
-        fast_deadline = time.monotonic() + browser_harvest.FAST_EXIT_NO_CAPTCHA
-
-        for i in range(SOLVE_ATTEMPTS):
+        while True:
             src = page_src()
             if browser_harvest.page_passed_html(src):
-                break
+                try:
+                    cookie = sb.cdp.evaluate("document.cookie") or ""
+                except Exception:
+                    cookie = ""
+                try:
+                    ua = sb.cdp.evaluate("navigator.userAgent") or ""
+                except Exception:
+                    ua = ""
+                if "datadome=" in cookie:
+                    break
+
             if browser_harvest.page_challenged_html(src):
                 captcha_seen = True
-                try:
-                    sb.cdp.solve_captcha()
-                except Exception as e:
-                    print(f"[sb_mint] solve attempt {i + 1} error: {e}", file=sys.stderr)
+                if auto_attempts < SOLVE_ATTEMPTS:
+                    auto_attempts += 1
+                    try:
+                        sb.cdp.solve_captcha()
+                    except Exception as e:
+                        print(f"[sb_mint] auto-solve attempt {auto_attempts}: {e}", file=sys.stderr)
+                if not prompt_shown:
+                    prompt_shown = True
+                    print(
+                        "\n>>> Captcha detected — solve the slider in the Chrome window.\n"
+                        "    (Window stays open until you pass.)\n",
+                        flush=True,
+                    )
             elif not captcha_seen and time.monotonic() > fast_deadline:
                 break
-            sb.sleep(WAIT_PER_ATTEMPT)
 
-        if browser_harvest.page_passed_html(page_src()):
-            try:
-                cookie = sb.cdp.evaluate("document.cookie") or ""
-            except Exception:
-                cookie = ""
-            try:
-                ua = sb.cdp.evaluate("navigator.userAgent") or ""
-            except Exception:
-                ua = ""
+            sb.sleep(WAIT_PER_ATTEMPT if captcha_seen else browser_harvest.POLL_INTERVAL)
+
     return cookie.strip(), ua.strip()
 
 
 def harvest_cookie() -> str:
-    """Mint a fresh validated cookie automatically.
-
-    Returns the full document.cookie string (containing a validated
-    `datadome`), or '' on failure. Sets module-level LAST_UA on success so
-    callers can keep the User-Agent in sync with the cookie's fingerprint.
-    """
     global LAST_UA
     cookie, ua = _mint()
     if "datadome=" in cookie:
@@ -98,8 +92,6 @@ def harvest_cookie() -> str:
 
 
 def update_session(cookie: str, ua: str = "") -> None:
-    """Write the cookie (and matching UA, if captured) into session.py and
-    clear the stale rotated-cookie cache so curl_cffi starts fresh."""
     bootstrap.ensure_session_file()
     src = SESSION_FILE.read_text()
     src = re.sub(
@@ -123,13 +115,12 @@ def update_session(cookie: str, ua: str = "") -> None:
 
 
 def main() -> int:
-    print("[sb_mint] Launching stealth Chrome and auto-solving the slider...")
+    print("[sb_mint] Launching Chrome for CanLII session...")
     cookie, ua = _mint()
     if "datadome=" not in cookie:
         print(
-            "[sb_mint] Failed to mint a validated cookie. "
-            "Check Screen Recording + Accessibility permissions, "
-            "or fall back to: python auto_refresh.py",
+            "[sb_mint] Did not capture a validated cookie. "
+            "If a captcha was shown, solve it in Chrome and run again.",
             file=sys.stderr,
         )
         return 1
