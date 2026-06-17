@@ -44,48 +44,51 @@ def _reload_session() -> None:
     cs.HEADERS = _s.HEADERS
 
 
-def refresh_until_valid() -> bool:
-    """Refresh the session until --check passes. No curl.txt; solve in window."""
+def refresh_until_valid(juris: str) -> bool:
+    """Refresh the session until check_session passes. One browser window only."""
+    print("\nOpening ONE Chrome incognito window — solve the captcha if shown.\n", flush=True)
+    cookie = auto_refresh.harvest_cookie_macos(keep_open=True)
     while True:
-        cookie = auto_refresh.harvest_cookie(skip_auto_solve=True)
-        if cookie:
+        if not cookie:
+            cookie = auto_refresh.poll_incognito_windows()
+        if cookie and "datadome=" in cookie:
             auto_refresh.update_session_cookie(cookie, getattr(auto_refresh, "LAST_UA", ""))
             _reload_session()
-            if subprocess.call([sys.executable, "canlii_scraper.py", "--check"]) == 0:
+            if cs.check_session(juris):
+                print("Session OK.\n", flush=True)
                 return True
-            print("Cookie captured but session check still failed — trying again...", flush=True)
+            print("Cookie saved but CanLII still blocked — try solving again.", flush=True)
         try:
-            input("\nSession still blocked. Solve the captcha in Chrome, "
-                  "then press Enter to retry (Ctrl+C to quit)... ")
+            input("\nSolve the captcha in that Chrome window, then press Enter "
+                  "(Ctrl+C to quit)... ")
         except (KeyboardInterrupt, EOFError):
             return False
+        cookie = auto_refresh.poll_incognito_windows()
 
 
-def ensure_session_or_refresh() -> bool:
-    """Validate session before network calls; refresh first if blocked."""
-    if subprocess.call(
-        [sys.executable, "canlii_scraper.py", "--check"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ) == 0:
+def ensure_session_or_refresh(juris: str) -> bool:
+    """Validate session for this jurisdiction; refresh first if blocked."""
+    print(f"Checking session for {juris}...", flush=True)
+    if cs.check_session(juris):
         return True
-    print("\nSession needs a fresh cookie before listing databases.")
-    print("A Chrome incognito window will open — solve the captcha if shown.\n")
-    return refresh_until_valid()
+    print("\nSession needs a fresh cookie before listing databases.\n")
+    return refresh_until_valid(juris)
 
 
 def _discover_dbs_with_refresh(juris: str) -> dict:
     """Fetch the database list for a jurisdiction, refreshing if blocked."""
-    if not ensure_session_or_refresh():
+    if not ensure_session_or_refresh(juris):
         raise KeyboardInterrupt()
     while True:
         session = cs.make_session()
         try:
             print(f"Listing databases for {juris}...", flush=True)
-            return cs.discover_databases(session, juris)
+            dbs = cs.discover_databases(session, juris)
+            print(f"Found {len(dbs)} databases.\n", flush=True)
+            return dbs
         except cs.SessionExpired:
             print("\nSession blocked while listing databases — refreshing...")
-            if not refresh_until_valid():
+            if not refresh_until_valid(juris):
                 raise
             print("Session refreshed. Retrying...\n")
 
@@ -170,6 +173,9 @@ def main() -> int:
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
           f"workers={workers} rate={rate:g} req/s | OS: {platform_util.system()} "
           f"| harvest: {platform_util.harvest_backend()}\n")
+
+    if juris != "all" and not ensure_session_or_refresh(juris):
+        return 130
 
     return run_parallel(juris, db_list, years, workers, rate)
 

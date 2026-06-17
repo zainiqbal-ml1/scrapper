@@ -116,6 +116,15 @@ def make_session() -> requests.Session:
     )
 
 
+def check_session(juris: str = "on") -> bool:
+    """True when the session can load a jurisdiction landing page."""
+    try:
+        discover_databases(make_session(), juris)
+        return True
+    except SessionExpired:
+        return False
+
+
 def _is_challenge(r) -> bool:
     """True if the response is an anti-bot challenge, not real content.
 
@@ -544,13 +553,12 @@ def main() -> int:
 
     # --check: validate the session against the chosen (or Ontario) jurisdiction.
     if args.check:
-        try:
-            discover_databases(session, args.juris if args.juris and args.juris != "all" else "on")
+        juris = args.juris if args.juris and args.juris != "all" else "on"
+        if check_session(juris):
             print("SESSION OK")
             return 0
-        except SessionExpired:
-            print("SESSION BLOCKED")
-            return 2
+        print("SESSION BLOCKED")
+        return 2
 
     if args.list_dbs:
         if not args.juris or args.juris == "all":

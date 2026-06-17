@@ -12,6 +12,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -41,13 +42,15 @@ AS_OPEN = f'''
 tell application "Google Chrome"
   set w to make new window with properties {{mode:"incognito"}}
   set URL of active tab of w to "{START_URL}"
+  return index of w as text
 end tell
 '''
 
-AS_POLL = f'''
+def _as_poll_window(win_idx: int) -> str:
+    return f'''
 tell application "Google Chrome"
   try
-    set t to active tab of front window
+    set t to active tab of window {win_idx}
     set c to execute t javascript "document.cookie"
     set challenged to execute t javascript "{CHALLENGE_JS}"
     return c & "|||" & challenged
@@ -57,20 +60,39 @@ tell application "Google Chrome"
 end tell
 '''
 
-AS_ACTIVATE = '''
-tell application "Google Chrome"
-  activate
-  set index of front window to 1
-end tell
-'''
-
-AS_CLOSE = '''
+AS_ACTIVATE_WINDOW = '''
 tell application "Google Chrome"
   try
-    close front window
+    activate
+    set index of window %s to 1
   end try
 end tell
 '''
+
+AS_CLOSE_WINDOW = '''
+tell application "Google Chrome"
+  try
+    close window %s
+  end try
+end tell
+'''
+
+AS_SCAN_INCOGNITO = f'''
+tell application "Google Chrome"
+  repeat with w in windows
+    try
+      if mode of w is "incognito" then
+        set c to execute active tab of w javascript "document.cookie"
+        set challenged to execute active tab of w javascript "{CHALLENGE_JS}"
+        if c contains "datadome=" and challenged is not "1" then return c
+      end if
+    end try
+  end repeat
+end tell
+return ""
+'''
+
+_harvest_lock = threading.Lock()
 
 
 def _run_as(script: str) -> str:
@@ -139,40 +161,55 @@ def run_applescript() -> str:
     return proc.stdout.strip()
 
 
-def harvest_cookie_macos(*, quiet: bool = False) -> str:
-    """macOS: incognito via AppleScript, polled from Python for faster detection."""
+def poll_incognito_windows(*, quiet: bool = False) -> str:
+    """Read datadome cookie from any open incognito window (no new window)."""
     if not platform_util.has_osascript():
         return ""
-    if not quiet:
-        print(
-            "\n>>> Opening Chrome incognito — solve the captcha if shown.\n"
-            "    (If this never finishes: Chrome menu View > Developer >\n"
-            "     Allow JavaScript from Apple Events)\n",
-            flush=True,
-        )
-    _run_as(AS_OPEN)
-    js_hint_shown = False
-    cookie = ""
-    for i in range(MAC_POLL_TRIES):
-        raw = _run_as(AS_POLL)
-        parts = (raw or "|||1").split("|||", 1)
-        cookie = parts[0].strip() if parts else ""
-        challenged = parts[1].strip() if len(parts) > 1 else "1"
-        if "datadome=" in cookie and challenged != "1":
-            break
-        if challenged == "1":
-            _run_as(AS_ACTIVATE)
-        elif i > 20 and not cookie and not js_hint_shown and not quiet:
+    cookie = _run_as(AS_SCAN_INCOGNITO).strip()
+    if cookie and "datadome=" in cookie and not quiet:
+        print(">>> Cookie read from open Chrome window.\n", flush=True)
+    return cookie if "datadome=" in cookie else ""
+
+
+def harvest_cookie_macos(*, quiet: bool = False, keep_open: bool = False) -> str:
+    """macOS: one incognito window, poll that exact window index."""
+    if not platform_util.has_osascript():
+        return ""
+    with _harvest_lock:
+        if not quiet:
             print(
-                "    Tip: enable Chrome > View > Developer > "
-                "Allow JavaScript from Apple Events",
+                "\n>>> Opening Chrome incognito — solve the captcha if shown.\n"
+                "    (If this never finishes: Chrome menu View > Developer >\n"
+                "     Allow JavaScript from Apple Events)\n",
                 flush=True,
             )
-            js_hint_shown = True
-        if not quiet and i > 0 and i % 20 == 0:
-            print(f"    still waiting... ({i * MAC_POLL_INTERVAL:.0f}s)", flush=True)
-        time.sleep(MAC_POLL_INTERVAL)
-    _run_as(AS_CLOSE)
+        raw_idx = _run_as(AS_OPEN).strip()
+        if not raw_idx.isdigit():
+            return poll_incognito_windows(quiet=quiet)
+        win_idx = int(raw_idx)
+        js_hint_shown = False
+        cookie = ""
+        for i in range(MAC_POLL_TRIES):
+            raw = _run_as(_as_poll_window(win_idx))
+            parts = (raw or "|||1").split("|||", 1)
+            cookie = parts[0].strip() if parts else ""
+            challenged = parts[1].strip() if len(parts) > 1 else "1"
+            if "datadome=" in cookie and challenged != "1":
+                break
+            if challenged == "1":
+                _run_as(AS_ACTIVATE_WINDOW % win_idx)
+            elif i > 10 and not cookie and not js_hint_shown and not quiet:
+                print(
+                    "    Tip: enable Chrome > View > Developer > "
+                    "Allow JavaScript from Apple Events",
+                    flush=True,
+                )
+                js_hint_shown = True
+            if not quiet and i > 0 and i % 20 == 0:
+                print(f"    still waiting... ({i * MAC_POLL_INTERVAL:.0f}s)", flush=True)
+            time.sleep(MAC_POLL_INTERVAL)
+        if "datadome=" in cookie or not keep_open:
+            _run_as(AS_CLOSE_WINDOW % win_idx)
     if cookie and "datadome=" in cookie and not quiet:
         print(">>> Cookie captured.\n", flush=True)
     return cookie.strip() if "datadome=" in cookie else ""

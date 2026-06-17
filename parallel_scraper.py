@@ -77,34 +77,41 @@ class RateLimiter:
 class CookiePool:
     """Queue of ready cookies; background harvesters refill when low.
 
-  - macOS: up to 3 parallel AppleScript incognito harvests, pool kept ahead.
-  - Linux/Windows: one harvest at a time, lazy fill (avoids slow browser spam).
+    Only one browser harvest runs at a time. Prefetch ramps up after the first
+    successful API call so startup never opens multiple windows.
     """
 
     COOKIE_BUDGET = 75
     MIN_READY = 2
     ACQUIRE_POLL = 0.02
     ACQUIRE_MAX_WAIT = 120
+    MAX_PARALLEL_HARVESTS = 1
 
     def __init__(self, workers: int = 3):
         self._workers = max(1, workers)
-        if platform_util.is_linux() or platform_util.is_windows():
-            self.MAX_PARALLEL_HARVESTS = 1
-            self.TARGET_READY = max(1, min(self._workers, 2))
-            self._aggressive_prefetch = False
-        else:
-            self.MAX_PARALLEL_HARVESTS = 3
-            self.TARGET_READY = max(self.MIN_READY, self._workers + 3)
-            self._aggressive_prefetch = True
+        self.TARGET_READY = max(1, min(self._workers, 2))
+        self._prefetch_enabled = False
         self._ready: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
         self._harvests_lock = threading.Lock()
         self._active_harvests = 0
         self._harvest_serial = 0
         self._ready.put(COOKIE)
-        # Never harvest on startup — avoids opening incognito while listing DBs.
         self._maintainer = threading.Thread(target=self._maintainer_loop, daemon=True, name="cookie-pool")
         self._maintainer.start()
+
+    def enable_prefetch(self) -> None:
+        """After session is proven good, keep more cookies ready (macOS: up to 2 parallel)."""
+        if self._prefetch_enabled:
+            return
+        self._prefetch_enabled = True
+        if platform_util.is_macos():
+            self.MAX_PARALLEL_HARVESTS = 2
+            self.TARGET_READY = max(self.MIN_READY, self._workers + 2)
+        else:
+            self.MAX_PARALLEL_HARVESTS = 1
+            self.TARGET_READY = max(1, min(self._workers, 2))
+        self.kick_fill()
 
     def _do_harvest(self) -> str:
         with self._harvests_lock:
@@ -146,12 +153,12 @@ class CookiePool:
                 ).start()
 
     def _maintainer_loop(self) -> None:
-        threshold = 1 if not self._aggressive_prefetch else self.TARGET_READY
-        poll = 0.5 if not self._aggressive_prefetch else 0.15
         while not self._stop.is_set():
-            if self._ready.qsize() < threshold:
+            if self._ready.qsize() < 1:
                 self._start_harvests()
-            time.sleep(poll)
+            elif self._prefetch_enabled and self._ready.qsize() < self.TARGET_READY:
+                self._start_harvests()
+            time.sleep(0.5)
 
     def ready_count(self) -> int:
         return self._ready.qsize()
@@ -168,7 +175,10 @@ class CookiePool:
         self.kick_fill()
         deadline = time.monotonic() + self.ACQUIRE_MAX_WAIT
         while time.monotonic() < deadline and not self._stop.is_set():
-            if self._ready.qsize() < (1 if not self._aggressive_prefetch else self.TARGET_READY):
+            need = 1 if self._ready.qsize() < 1 else (
+                self.TARGET_READY if self._prefetch_enabled else 1
+            )
+            if self._ready.qsize() < need:
                 self.kick_fill()
             try:
                 return self._ready.get(timeout=self.ACQUIRE_POLL)
@@ -257,7 +267,7 @@ def download_task(pool: CookiePool, limiter: RateLimiter, task: dict) -> tuple[d
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(r.content)
         _local.used = getattr(_local, "used", 0) + 1
-        if _local.used >= CookiePool.COOKIE_BUDGET - 15 and pool._aggressive_prefetch:
+        if _local.used >= CookiePool.COOKIE_BUDGET - 15 and pool._prefetch_enabled:
             pool.kick_fill()
         return task, True, f"{len(r.content)//1024} KB"
     except NeedNewCookie:
@@ -412,6 +422,7 @@ def _pooled_get_years(pool: CookiePool, limiter: RateLimiter, juris: str, db: st
 def _scrape_juris(pool, limiter, juris, db_arg, args, grand) -> None:
     out = cs.OUT_ROOT
     all_dbs = _pooled_discover_databases(pool, limiter, juris)
+    pool.enable_prefetch()
     targets = list(all_dbs.keys()) if db_arg == ["all"] else db_arg
     print(f"\n=== {juris} ({cs.JURISDICTIONS.get(juris, juris)}): {len(targets)} db(s) ===")
 
@@ -481,9 +492,8 @@ def main() -> int:
     pool = CookiePool(workers=args.workers)
     limiter = RateLimiter(args.rate)
 
-    print(f"Cookie pool: target {pool.TARGET_READY} ready, up to "
-          f"{pool.MAX_PARALLEL_HARVESTS} parallel harvest"
-          f"{' (lazy until needed)' if not pool._aggressive_prefetch else ''}.\n")
+    print(f"Cookie pool: one harvest window until session proven; then up to "
+          f"{pool.MAX_PARALLEL_HARVESTS} parallel.\n")
 
     jurisdictions = list(cs.JURISDICTIONS.keys()) if args.juris == "all" else [args.juris]
     grand = {"total": 0, "downloaded": 0, "failed": 0}
