@@ -46,10 +46,11 @@ xvfb-run python run.py
 
 ### Performance and rate limiting
 
-CanLII's anti-bot (DataDome) throttles by **IP address, not by cookie**, so running many parallel workers does **not** speed things up — it just trips rate limits faster. The scraper uses a **single download worker** and one shared cookie, and lets you control throughput with **requests/second**.
+CanLII's anti-bot (DataDome) throttles by **IP address**, so the scraper uses a **single download worker** and controls throughput with **requests/second**.
 
-- All requests share one active cookie; it's only re-harvested when genuinely burned (403/captcha).
-- On HTTP 429 the scraper **automatically slows down** and recovers gradually — it does not churn cookies.
+- A **cookie pool** keeps **4 cookies** ready in the background (harvest windows refill the queue).
+- On **any error** (429, 403, network, bad response) the scraper **discards that cookie and grabs the next one** from the pool — it never retries with a burned cookie.
+- Progress shows `pool=3/4` so you can see when the queue is running low.
 - Pick a `--rate` your IP tolerates. Start around `2`-`4`; lower it if you see frequent 429s.
 
 ```bash
@@ -101,7 +102,7 @@ python auto_refresh.py
 ## How it works
 
 - Downloads use `curl_cffi` with Chrome TLS impersonation and a `datadome` cookie.
-- When cookies expire, a **cookie pool** harvests new ones in the background (macOS: up to 3 AppleScript windows; Linux: one system-Chrome window at a time).
+- When cookies run out, a **cookie pool** harvests replacements in the background (up to 2 parallel on macOS, 1 on Linux).
 - Existing PDFs and completed years are skipped on resume.
 - Failed downloads are retried until they succeed.
 

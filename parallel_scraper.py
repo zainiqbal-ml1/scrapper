@@ -6,13 +6,11 @@ Same output as canlii_scraper.py:
     data/<state>/<db>/<year>.json
 
 How it scales (and its limits):
-  - Runs N worker threads that all SHARE one active datadome cookie.
-    DataDome throttles by IP, not by cookie, so more cookies don't raise
-    throughput — the shared rate limiter is the real ceiling.
-  - On HTTP 429 the rate limiter backs off globally (no cookie swap).
-  - On HTTP 403 / captcha the active cookie is burned: exactly one browser
-    harvest runs to replace it and every worker switches to the new cookie.
-  - Failed PDFs are retried until they all succeed.
+  - Keeps 3–4 validated cookies in a pool; background harvesters refill it.
+  - On ANY error (429, 403, bad response) the worker discards its cookie and
+    grabs the next one from the pool immediately — never retries with a burned cookie.
+  - A shared rate limiter caps total requests/sec (single IP ceiling).
+  - Failed PDFs are retried until they all succeed (each retry uses fresh cookies).
   - Years with missing/failed PDFs are NOT skipped on resume.
 
 Examples:
@@ -43,6 +41,8 @@ from session import HEADERS, COOKIE
 
 
 class NeedNewCookie(Exception):
+    """Pool has no usable cookies left."""
+
     pass
 
 
@@ -102,128 +102,123 @@ class RateLimiter:
 
 
 class CookiePool:
-    """Manages ONE shared 'active' cookie that all workers use concurrently.
+    """Queue of ready cookies; background harvesters keep 3–4 ahead.
 
-    DataDome rate-limits by IP, not by cookie, so handing every worker a
-    different cookie does not raise throughput — it just forces slow browser
-    harvests. Instead:
-
-      - All workers share the current active cookie (built per-thread, rebuilt
-        only when the active cookie's generation changes).
-      - On 429 (rate limit) we DON'T swap cookies (a new cookie from the same
-        IP is throttled too) — the rate limiter backs off globally.
-      - On 403 / captcha the active cookie is genuinely burned: exactly one
-        harvest runs to replace it, and every worker switches to the new one.
-      - Spare cookies harvested ahead of time live in `_ready` as a fast
-        replacement so a burn doesn't always block on a browser window.
+    Workers take a cookie from the queue. On any request error the cookie is
+    discarded and the next ready cookie is used — never retry with a burned one.
     """
 
-    SPARE_TARGET = 1  # keep at most one spare ready (harvest is expensive)
-
-    def __init__(self, workers: int = 3):
-        self._workers = max(1, workers)
-        self._active = COOKIE
-        self._generation = 0
-        self._lock = threading.Lock()
-        self._ready: queue.Queue[str] = queue.Queue()
-        self._harvesting = threading.Event()
-        self._stop = threading.Event()
-        self._pause_until = 0.0
-        self._prefetch_enabled = False
-
-    # -- active cookie ---------------------------------------------------- #
-    def current(self) -> tuple[str, int]:
-        with self._lock:
-            return self._active, self._generation
-
-    def report_burned(self, generation: int) -> str:
-        """The cookie at `generation` got a 403/challenge. Replace it once.
-
-        Returns the new active cookie. If another thread already replaced this
-        generation (or is replacing it now), this waits for that rotation
-        instead of harvesting a second time.
-        """
-        with self._lock:
-            if generation != self._generation:
-                return self._active  # already rotated by someone else
-            if self._harvesting.is_set():
-                already = True
-            else:
-                already = False
-                self._harvesting.set()
-
-        if already:
-            return self._wait_for_rotation(generation)
-
-        try:
-            new = self._take_spare() or auto_refresh.harvest_cookie_pool() or ""
-        finally:
-            self._harvesting.clear()
-        with self._lock:
-            if new and "datadome=" in new and generation == self._generation:
-                self._active = new
-                self._generation += 1
-                print(f"    >>> active cookie rotated (gen {self._generation}, "
-                      f"tok {_dd(new)})", flush=True)
-            return self._active
-
-    def _wait_for_rotation(self, generation: int) -> str:
-        """Block until another thread rotates past `generation`."""
-        deadline = time.monotonic() + self.ACQUIRE_MAX_WAIT
-        while time.monotonic() < deadline and not self._stop.is_set():
-            with self._lock:
-                if self._generation != generation:
-                    return self._active
-            time.sleep(0.1)
-        return self.current()[0]
-
-    def _take_spare(self) -> str:
-        try:
-            return self._ready.get_nowait()
-        except queue.Empty:
-            return ""
-
-    # -- backoff ---------------------------------------------------------- #
-    def backoff(self, seconds: float) -> None:
-        with self._lock:
-            self._pause_until = max(self._pause_until, time.monotonic() + seconds)
-
-    def wait_if_paused(self) -> None:
-        while not self._stop.is_set():
-            with self._lock:
-                remaining = self._pause_until - time.monotonic()
-            if remaining <= 0:
-                return
-            time.sleep(min(remaining, 0.5))
-
-    # -- spare prefetch (optional, non-blocking) -------------------------- #
+    TARGET_READY = 4
+    MAX_PARALLEL_HARVESTS = 2 if platform_util.is_macos() else 1
+    ACQUIRE_POLL = 0.05
     ACQUIRE_MAX_WAIT = 180
 
+    def __init__(self, workers: int = 1):
+        self._workers = max(1, workers)
+        self._ready: queue.Queue[str] = queue.Queue()
+        self._stop = threading.Event()
+        self._harvests_lock = threading.Lock()
+        self._active_harvests = 0
+        self._harvest_serial = 0
+        self._prefetch_enabled = False
+        self._ready.put(COOKIE)
+        self._maintainer = threading.Thread(
+            target=self._maintainer_loop, daemon=True, name="cookie-pool",
+        )
+        self._maintainer.start()
+
+    def ready_count(self) -> int:
+        return self._ready.qsize()
+
     def enable_prefetch(self) -> None:
-        """Allow keeping one spare cookie ready (only after session proven)."""
+        """Start keeping the pool filled after the session is proven good."""
+        if self._prefetch_enabled:
+            return
         self._prefetch_enabled = True
+        print(f"Cookie pool: keeping {self.TARGET_READY} ready "
+              f"(up to {self.MAX_PARALLEL_HARVESTS} parallel harvests).\n", flush=True)
+        self.kick_fill()
 
-    def maybe_prefetch_spare(self) -> None:
-        """Harvest one spare in the background if none is ready (best effort)."""
-        if not self._prefetch_enabled or self._stop.is_set():
-            return
-        if self._ready.qsize() >= self.SPARE_TARGET or self._harvesting.is_set():
-            return
-        threading.Thread(target=self._prefetch_worker, daemon=True,
-                         name="cookie-prefetch").start()
+    def _do_harvest(self) -> str:
+        with self._harvests_lock:
+            self._harvest_serial += 1
+            n = self._harvest_serial
+        print(f"\n>>> Harvesting cookie #{n} for pool "
+              f"(ready={self._ready.qsize()}/{self.TARGET_READY})...\n", flush=True)
+        cookie = auto_refresh.harvest_cookie_pool(quiet=True, timeout_s=180)
+        if cookie and "datadome=" in cookie:
+            print(f">>> Cookie #{n} ready — pool now ~{self._ready.qsize() + 1}.\n", flush=True)
+        else:
+            print(f">>> Cookie #{n} harvest failed (solve captcha if a window opened).\n", flush=True)
+        return cookie
 
-    def _prefetch_worker(self) -> None:
-        if self._harvesting.is_set():
-            return
-        self._harvesting.set()
+    def _harvest_worker(self) -> None:
         try:
-            cookie = auto_refresh.harvest_cookie_pool()
+            if self._stop.is_set():
+                return
+            cookie = self._do_harvest()
             if cookie and "datadome=" in cookie:
                 self._ready.put(cookie)
         except Exception as e:
-            print(f"[cookie-pool] spare harvest failed: {e}", file=sys.stderr, flush=True)
+            print(f"[cookie-pool] harvest failed: {e}", file=sys.stderr, flush=True)
         finally:
-            self._harvesting.clear()
+            with self._harvests_lock:
+                self._active_harvests -= 1
+            if not self._stop.is_set():
+                self.kick_fill()
+
+    def kick_fill(self) -> None:
+        """Launch background harvests until the pool reaches TARGET_READY."""
+        if self._stop.is_set() or not self._prefetch_enabled:
+            return
+        with self._harvests_lock:
+            needed = self.TARGET_READY - self._ready.qsize()
+            slots = self.MAX_PARALLEL_HARVESTS - self._active_harvests
+            to_start = min(max(needed, 0), max(slots, 0))
+            for _ in range(to_start):
+                self._active_harvests += 1
+                threading.Thread(
+                    target=self._harvest_worker, daemon=True, name="cookie-harvest",
+                ).start()
+
+    def _maintainer_loop(self) -> None:
+        while not self._stop.is_set():
+            if self._prefetch_enabled and self._ready.qsize() < self.TARGET_READY:
+                self.kick_fill()
+            time.sleep(0.4)
+
+    def acquire(self) -> str:
+        """Take the next ready cookie; wait for harvest if the pool is empty."""
+        try:
+            return self._ready.get_nowait()
+        except queue.Empty:
+            pass
+        self.kick_fill()
+        deadline = time.monotonic() + self.ACQUIRE_MAX_WAIT
+        while time.monotonic() < deadline and not self._stop.is_set():
+            self.kick_fill()
+            try:
+                return self._ready.get(timeout=self.ACQUIRE_POLL)
+            except queue.Empty:
+                continue
+        with self._harvests_lock:
+            if self._active_harvests > 0:
+                # Another harvest is running; wait for it to fill the queue.
+                while time.monotonic() < deadline and not self._stop.is_set():
+                    try:
+                        return self._ready.get(timeout=self.ACQUIRE_POLL)
+                    except queue.Empty:
+                        continue
+                raise NeedNewCookie("timed out waiting for pool harvest")
+            self._active_harvests += 1
+        try:
+            cookie = self._do_harvest()
+        finally:
+            with self._harvests_lock:
+                self._active_harvests -= 1
+        if cookie and "datadome=" in cookie:
+            return cookie
+        raise NeedNewCookie("blocking harvest failed")
 
     def stop(self) -> None:
         self._stop.set()
@@ -237,66 +232,79 @@ def _dd(cookie: str) -> str:
     return cookie[i + 9:i + 19] if i >= 0 else "NONE"
 
 
-def get_session(pool: CookiePool) -> requests.Session:
-    """Per-thread session built from the shared active cookie.
+def _discard_session() -> None:
+    _local.session = None
+    _local.cookie = None
 
-    Rebuilds only when the active cookie generation changes (i.e. after a burn).
-    """
-    cookie, gen = pool.current()
-    if getattr(_local, "session", None) is None or getattr(_local, "gen", -1) != gen:
-        _local.session = requests.Session(
-            impersonate=cs.IMPERSONATE, headers=HEADERS,
-            cookies=parse_cookie(cookie), timeout=60,
-        )
-        _local.gen = gen
+
+def get_session(pool: CookiePool) -> requests.Session:
+    """Per-thread session; acquires a fresh pool cookie when the old one was discarded."""
+    if getattr(_local, "session", None) and getattr(_local, "cookie", None):
+        return _local.session
+    cookie = pool.acquire()
+    _local.cookie = cookie
+    _local.session = requests.Session(
+        impersonate=cs.IMPERSONATE, headers=HEADERS,
+        cookies=parse_cookie(cookie), timeout=60,
+    )
     return _local.session
 
 
+def _swap_cookie(pool: CookiePool, *, reason: str = "") -> None:
+    """Discard the current cookie and take the next one from the pool."""
+    tok = _dd(getattr(_local, "cookie", "") or "")
+    if reason:
+        print(f"    (new cookie from pool: {reason}, had tok={tok})", flush=True)
+    _discard_session()
+    pool.kick_fill()
+
+
 def worker_get(pool: CookiePool, limiter: RateLimiter, url: str, referer: str | None):
-    """One GET. 429 -> global backoff (no swap). 403/challenge -> rotate cookie."""
+    """One GET. Any error -> discard cookie and retry with the next pool cookie."""
     headers = {"referer": referer} if referer else None
-    for attempt in range(6):
-        pool.wait_if_paused()
-        s = get_session(pool)
-        gen = getattr(_local, "gen", 0)
-        limiter.wait()
+    last_status = 0
+    for attempt in range(8):
         try:
+            s = get_session(pool)
+            limiter.wait()
             r = s.get(url, headers=headers)
-        except Exception:
-            time.sleep(1.0 + attempt)
+        except Exception as e:
+            _swap_cookie(pool, reason=f"network ({type(e).__name__})")
+            time.sleep(0.5)
             continue
+        last_status = r.status_code
         if r.status_code == 429:
-            # IP-wide throttle. Slow everyone down; reusing/replacing the cookie
-            # would not help and just burns it toward a 403.
             limiter.slow_down()
-            pool.backoff(4.0 + attempt * 4.0)
+            _swap_cookie(pool, reason="429 rate limit")
+            time.sleep(1.0)
             continue
         if cs._is_challenge(r):
-            # Genuine 403/captcha: the active cookie is burned. Rotate once.
-            pool.report_burned(gen)
+            _swap_cookie(pool, reason="403/captcha")
+            continue
+        if r.status_code != 200:
+            _swap_cookie(pool, reason=f"HTTP {r.status_code}")
             continue
         limiter.on_success()
         return r
-    raise NeedNewCookie()
+    raise NeedNewCookie(f"exhausted pool cookies (last HTTP {last_status})")
 
 
 def download_task(pool: CookiePool, limiter: RateLimiter, task: dict) -> tuple[dict, bool, str]:
-    """Download one PDF using the shared cookie + adaptive rate limiting."""
+    """Download one PDF; swap to a new pool cookie on any error."""
     dest = Path(task["dest"])
     if dest.exists() and dest.stat().st_size > 0:
         return task, True, "exists"
     try:
         r = worker_get(pool, limiter, task["pdf_url"], task["html_url"])
-        if r.status_code != 200:
-            return task, False, f"HTTP {r.status_code}"
         if not r.content.startswith(b"%PDF"):
+            _swap_cookie(pool, reason="not a PDF")
             return task, False, "not a PDF"
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(r.content)
-        pool.maybe_prefetch_spare()
+        pool.kick_fill()
         return task, True, f"{len(r.content)//1024} KB"
-    except NeedNewCookie:
-        return task, False, "blocked after retries"
+    except NeedNewCookie as e:
+        return task, False, str(e) or "pool exhausted"
 
 
 def _year_complete(out: Path, juris: str, db: str, year: int) -> bool:
@@ -345,7 +353,8 @@ def _run_downloads(
             else:
                 failed.append(task)
             done += 1
-            bar = f"  {label}: [{done}/{total}] ok={ok} fail={len(failed)}"
+            bar = (f"  {label}: [{done}/{total}] ok={ok} fail={len(failed)} "
+                   f"pool={pool.ready_count()}/{pool.TARGET_READY}")
             sys.stdout.write("\r" + bar.ljust(72))
             sys.stdout.flush()
     sys.stdout.write("\r" + " " * 72 + "\r")
@@ -397,14 +406,14 @@ def _download_year_with_retries(
 
 
 def manager_get(pool: CookiePool, limiter: RateLimiter, url: str, referer: str | None = None):
-    """Main-thread listings; share the active cookie, rotate only on burn."""
+    """Main-thread listings; swap to next pool cookie on any error."""
     try:
         return worker_get(pool, limiter, url, referer)
-    except NeedNewCookie:
+    except NeedNewCookie as e:
         raise RuntimeError(
-            f"Could not fetch {url} — session is blocked (403). "
-            "Refresh the cookie via run.py and retry."
-        )
+            f"Could not fetch {url} — cookie pool exhausted ({e}). "
+            "Solve captcha in any harvest window that opened, then retry."
+        ) from e
 
 
 def _pooled_discover_databases(pool: CookiePool, limiter: RateLimiter, juris: str) -> dict[str, str]:
@@ -504,9 +513,10 @@ def main() -> int:
     cs.OUT_ROOT = Path(args.out)
     pool = CookiePool(workers=args.workers)
     limiter = RateLimiter(args.rate)
+    pool.enable_prefetch()
 
-    print("Cookie model: all workers share ONE active cookie; rotate only when "
-          "it's burned (403). 429 -> global slowdown, not a swap.\n")
+    print(f"Cookie pool: keeping {pool.TARGET_READY} cookies ready; "
+          f"swap on any error (429/403/network).\n")
 
     jurisdictions = list(cs.JURISDICTIONS.keys()) if args.juris == "all" else [args.juris]
     grand = {"total": 0, "downloaded": 0, "failed": 0}

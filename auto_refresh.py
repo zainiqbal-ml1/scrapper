@@ -345,16 +345,16 @@ def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def harvest_cookie_pool() -> str:
-    """Harvest a replacement cookie when the active one is burned (visible window)."""
+def harvest_cookie_pool(*, quiet: bool = False, timeout_s: float = 180) -> str:
+    """Harvest one validated cookie for the download pool."""
     global LAST_UA
     LAST_UA = ""
     if platform_util.has_osascript():
-        cookie = harvest_cookie_macos(keep_open=True, timeout_s=180)
+        cookie = harvest_cookie_macos(keep_open=True, quiet=quiet, timeout_s=timeout_s)
         if "datadome=" in cookie:
             return cookie
         if not LAST_MAC_NOJS:
-            return ""  # window worked but wasn't solved; don't open a second one
+            return ""
     if platform_util.is_linux():
         try:
             from linux_chrome_harvest import harvest_linux_fast
@@ -364,9 +364,10 @@ def harvest_cookie_pool() -> str:
                 LAST_UA = ua
                 return cookie
         except Exception as e:
-            print(f"[auto_refresh] Linux fast harvest failed ({e}); using SeleniumBase.", file=sys.stderr)
+            if not quiet:
+                print(f"[auto_refresh] Linux fast harvest failed ({e}); using SeleniumBase.", file=sys.stderr)
     cookie, ua = browser_harvest.harvest_cookie_interactive(
-        try_auto_solve=False, timeout_s=180,
+        try_auto_solve=False, quiet=quiet, timeout_s=timeout_s,
     )
     if "datadome=" in cookie:
         LAST_UA = ua
