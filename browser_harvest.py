@@ -1,7 +1,7 @@
 """Cross-platform cookie harvest via a real Chrome window (SeleniumBase).
 
-Shared pass/captcha detection used by AppleScript and SeleniumBase paths.
-Window closes only after captcha flow is fully done (including a second step).
+Shared pass/captcha detection used by AppleScript, SeleniumBase, and Linux paths.
+Window closes only after all captcha steps are done.
 """
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ import sys
 import time
 
 START_URL = "https://www.canlii.org/en/on/"
-POLL_INTERVAL = 0.4
-FAST_EXIT_NO_CAPTCHA = 20   # seconds: only when no captcha ever appeared
-STABLE_POLLS_NO_CAPTCHA = 4       # ~1.6s with no captcha ever shown
-STABLE_POLLS_AFTER_CAPTCHA = 15   # ~6s after any captcha — catches a second step
+POLL_INTERVAL = 0.25
+FAST_EXIT_NO_CAPTCHA = 15   # seconds when no captcha ever appeared
+STABLE_POLLS_NO_CAPTCHA = 2       # ~0.5s, no captcha path
+SETTLE_AFTER_CAPTCHA = 2.0        # seconds to watch for a second captcha step
 
 # AppleScript + CDP poll: "cookie|||passed|||challenged"
 POLL_JS = (
@@ -33,7 +33,6 @@ POLL_JS = (
 
 
 def parse_poll(raw: str) -> tuple[str, bool, bool]:
-    """Parse POLL_JS output -> (cookie, passed, challenged)."""
     parts = (raw or "|||0|||0").split("|||")
     cookie = parts[0].strip() if parts else ""
     passed = len(parts) > 1 and parts[1].strip() == "1"
@@ -53,56 +52,48 @@ def page_challenged_html(src: str) -> bool:
 
 
 def page_passed_html(src: str) -> bool:
-    low = (src or "").lower()
     if page_challenged_html(src):
         return False
-    return "canlii" in low
+    return "canlii" in (src or "").lower()
 
 
 def cookie_ready(cookie: str, *, challenged: bool) -> bool:
-    """True when document.cookie has datadome and no active challenge."""
     return bool(cookie) and "datadome=" in cookie and not challenged
 
 
 class StablePassTracker:
-    """Require several consecutive OK polls before accepting pass.
-
-    CanLII often shows a second captcha a moment after the DataDome slider;
-    a single OK poll was causing an early quit before step two appeared.
-    """
+    """Fast pass when clear; brief settle window after captcha for a possible second step."""
 
     def __init__(self) -> None:
         self.captcha_seen = False
         self.streak = 0
-        self._wait_hint = False
+        self._settle_start: float | None = None
         self._second_hint = False
 
     def update(self, *, cookie: str, challenged: bool, page_ok: bool) -> bool:
         if challenged:
-            if self.captcha_seen and self.streak > 0 and not self._second_hint:
+            if self.captcha_seen and self._settle_start is not None:
                 self._second_hint = True
             self.captcha_seen = True
             self.streak = 0
-            self._wait_hint = False
+            self._settle_start = None
             return False
 
         ok = cookie_ready(cookie, challenged=False) and page_ok
         if not ok:
             self.streak = 0
+            self._settle_start = None
             return False
 
-        if self.captcha_seen and self.streak == 0 and not self._wait_hint:
-            self._wait_hint = True
+        if not self.captcha_seen:
+            self.streak += 1
+            return self.streak >= STABLE_POLLS_NO_CAPTCHA
 
-        need = STABLE_POLLS_AFTER_CAPTCHA if self.captcha_seen else STABLE_POLLS_NO_CAPTCHA
-        self.streak += 1
-        return self.streak >= need
-
-    def should_print_wait_hint(self) -> bool:
-        if self._wait_hint and self.streak == 1 and self.captcha_seen:
-            self._wait_hint = False
-            return True
-        return False
+        now = time.monotonic()
+        if self._settle_start is None:
+            self._settle_start = now
+            return False
+        return (now - self._settle_start) >= SETTLE_AFTER_CAPTCHA
 
     def should_print_second_hint(self) -> bool:
         if self._second_hint:
@@ -130,51 +121,42 @@ def harvest_cookie_interactive(
 
     with SB(uc=True, headed=True, locale="en") as sb:
         sb.activate_cdp_mode(START_URL)
-        sb.sleep(1.5)
+        sb.sleep(1.0)
         while True:
             try:
                 src = sb.cdp.get_page_source() or ""
             except Exception:
                 src = ""
             challenged = page_challenged_html(src)
-
             try:
                 cookie = sb.cdp.evaluate("document.cookie") or ""
                 ua = sb.cdp.evaluate("navigator.userAgent") or ""
             except Exception:
                 cookie = ua = ""
 
-            page_ok = page_passed_html(src)
-            if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
+            if tracker.update(
+                cookie=cookie, challenged=challenged, page_ok=page_passed_html(src),
+            ):
                 break
 
             if challenged:
                 if not prompt_shown:
                     prompt_shown = True
                     print(
-                        "\n>>> Captcha detected — solve it in the Chrome window.\n"
-                        "    (If a second captcha appears, solve that too.)\n",
+                        "\n>>> Captcha — solve it in Chrome (including a second step if shown).\n",
                         flush=True,
                     )
                 elif tracker.should_print_second_hint() and not quiet:
-                    print(
-                        ">>> Another captcha step appeared — please solve it too.\n",
-                        flush=True,
-                    )
+                    print(">>> Second captcha — please solve it too.\n", flush=True)
                 if try_auto_solve:
                     try:
                         sb.cdp.solve_captcha()
                     except Exception as e:
                         if not quiet:
                             print(f"[browser] auto-solve: {e}", file=sys.stderr)
-            elif tracker.should_print_wait_hint() and not quiet:
-                print(
-                    ">>> First captcha cleared — waiting a few seconds in case another appears...\n",
-                    flush=True,
-                )
             elif not tracker.captcha_seen and time.monotonic() > fast_deadline:
                 if not quiet:
-                    print(">>> Page did not load in time (no captcha seen).", flush=True)
+                    print(">>> Page did not load in time.", flush=True)
                 break
 
             time.sleep(POLL_INTERVAL)

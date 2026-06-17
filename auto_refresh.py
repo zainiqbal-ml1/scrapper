@@ -24,8 +24,6 @@ AUTO_CAP_CACHE = Path(".auto_solve_capable")
 START_URL = browser_harvest.START_URL
 POLL_JS = browser_harvest.POLL_JS
 
-MAC_POLL_INTERVAL = 0.4
-
 # Set when Chrome blocks AppleScript JS (fall back to SeleniumBase).
 LAST_MAC_NOJS = False
 
@@ -169,23 +167,14 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
                 if not prompt_shown:
                     prompt_shown = True
                     print(
-                        ">>> Captcha detected — solve it in Chrome.\n"
-                        "    (If a second captcha appears, solve that too.)\n",
+                        ">>> Captcha — solve it in Chrome (including a second step if shown).\n",
                         flush=True,
                     )
                 elif tracker.should_print_second_hint():
-                    print(
-                        ">>> Another captcha step appeared — please solve it too.\n",
-                        flush=True,
-                    )
-            elif tracker.should_print_wait_hint():
-                print(
-                    ">>> First captcha cleared — waiting a few seconds in case another appears...\n",
-                    flush=True,
-                )
+                    print(">>> Second captcha — please solve it too.\n", flush=True)
             elif not tracker.captcha_seen and time.monotonic() > no_captcha_deadline:
                 break
-            time.sleep(MAC_POLL_INTERVAL)
+            time.sleep(browser_harvest.POLL_INTERVAL)
 
         if passed or not tracker.captcha_seen:
             _run_as(AS_CLOSE % win_idx, quiet=True)
@@ -269,13 +258,13 @@ def harvest_cookie_pool(*, quiet: bool = False) -> str:
         try:
             from linux_chrome_harvest import harvest_linux_fast
 
-            cookie, ua = harvest_linux_fast(quiet=True)
+            cookie, ua = harvest_linux_fast(quiet=quiet)
             if "datadome=" in cookie:
                 LAST_UA = ua
                 return cookie
         except Exception:
             pass
-    if quiet:
+    if quiet and not platform_util.is_linux():
         return ""
     return harvest_cookie_browser(try_auto=False, quiet=quiet)
 
@@ -296,7 +285,19 @@ def harvest_cookie() -> str:
                 # AppleScript window was waiting or failed — do not open a second browser.
                 return ""
 
-    # SeleniumBase path (Apple Events unavailable).
+    # Linux: system Chrome (same captcha/stable-pass logic as Mac).
+    if platform_util.is_linux():
+        try:
+            from linux_chrome_harvest import harvest_linux_fast
+
+            cookie, ua = harvest_linux_fast(quiet=False)
+            if "datadome=" in cookie:
+                LAST_UA = ua
+                return cookie
+        except Exception:
+            pass
+
+    # SeleniumBase fallback (Mac without Apple Events, etc.).
     cookie = harvest_cookie_browser(try_auto=False)
     if "datadome=" in cookie:
         return cookie

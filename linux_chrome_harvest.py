@@ -6,10 +6,16 @@ import subprocess
 import tempfile
 import time
 
-from browser_harvest import START_URL, page_passed_html
-
-POLL_INTERVAL = 0.5
-POLL_TRIES = 120  # ~60s
+from browser_harvest import (
+    POLL_INTERVAL,
+    POLL_JS,
+    START_URL,
+    StablePassTracker,
+    cookie_ready,
+    page_challenged_html,
+    page_passed_html,
+    parse_poll,
+)
 
 
 def find_chrome() -> str | None:
@@ -26,15 +32,35 @@ def find_chrome() -> str | None:
     return None
 
 
-def _page_passed(driver) -> bool:
+def _read_state(driver) -> tuple[str, str, bool, bool]:
     try:
-        return page_passed_html(driver.page_source or "")
+        src = driver.page_source or ""
     except Exception:
-        return False
+        src = ""
+    challenged = page_challenged_html(src)
+    page_ok = page_passed_html(src)
+    try:
+        raw = driver.execute_script(f"return {POLL_JS}") or ""
+        cookie, poll_passed, poll_challenged = parse_poll(str(raw))
+        if poll_challenged:
+            challenged = True
+        if poll_passed:
+            page_ok = True
+    except Exception:
+        cookie = ""
+        try:
+            cookie = driver.execute_script("return document.cookie") or ""
+        except Exception:
+            cookie = ""
+    try:
+        ua = driver.execute_script("return navigator.userAgent") or ""
+    except Exception:
+        ua = ""
+    return cookie, ua, challenged, page_ok
 
 
 def harvest_linux_fast(*, quiet: bool = True) -> tuple[str, str]:
-    """Launch system Chrome incognito, attach Selenium, read cookie when page passes."""
+    """Launch system Chrome, wait through captcha steps, capture cookie when stable."""
     chrome = find_chrome()
     if not chrome:
         return "", ""
@@ -45,7 +71,7 @@ def harvest_linux_fast(*, quiet: bool = True) -> tuple[str, str]:
     profile = tempfile.mkdtemp(prefix="canlii-harvest-")
     port = 19222 + (int(time.time()) % 1000)
     if not quiet:
-        print("\n>>> Linux: opening system Chrome (fast harvest)...\n", flush=True)
+        print("\n>>> Linux: opening Chrome...\n", flush=True)
 
     proc = subprocess.Popen(
         [
@@ -65,6 +91,11 @@ def harvest_linux_fast(*, quiet: bool = True) -> tuple[str, str]:
     driver = None
     cookie = ""
     ua = ""
+    passed = False
+    prompt_shown = False
+    tracker = StablePassTracker()
+    fast_deadline = time.monotonic() + 15
+
     try:
         opts = Options()
         opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
@@ -73,32 +104,44 @@ def harvest_linux_fast(*, quiet: bool = True) -> tuple[str, str]:
                 driver = webdriver.Chrome(options=opts)
                 break
             except Exception:
-                time.sleep(0.25)
+                time.sleep(0.2)
         if not driver:
             return "", ""
 
-        for _ in range(POLL_TRIES):
-            if _page_passed(driver):
-                try:
-                    cookie = driver.execute_script("return document.cookie") or ""
-                    ua = driver.execute_script("return navigator.userAgent") or ""
-                except Exception:
-                    cookie = ua = ""
-                if "datadome=" in cookie:
-                    break
+        while True:
+            cookie, ua, challenged, page_ok = _read_state(driver)
+            page_ok = page_ok or cookie_ready(cookie, challenged=False)
+
+            if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
+                passed = True
+                break
+
+            if challenged:
+                if not prompt_shown:
+                    prompt_shown = True
+                    print(
+                        ">>> Captcha — solve it in Chrome (including a second step if shown).\n",
+                        flush=True,
+                    )
+                elif tracker.should_print_second_hint():
+                    print(">>> Second captcha — please solve it too.\n", flush=True)
+            elif not tracker.captcha_seen and time.monotonic() > fast_deadline:
+                break
+
             time.sleep(POLL_INTERVAL)
     finally:
-        if driver:
+        if passed or not tracker.captcha_seen:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+            proc.terminate()
             try:
-                driver.quit()
+                proc.wait(timeout=3)
             except Exception:
-                pass
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except Exception:
-            proc.kill()
-        shutil.rmtree(profile, ignore_errors=True)
+                proc.kill()
+            shutil.rmtree(profile, ignore_errors=True)
 
     if cookie and "datadome=" in cookie and not quiet:
         print(">>> Linux cookie captured.\n", flush=True)

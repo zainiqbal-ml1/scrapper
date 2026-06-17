@@ -14,7 +14,7 @@ SESSION_FILE = Path("session.py")
 COOKIE_STATE = Path(".cookie_state.json")
 START_URL = browser_harvest.START_URL
 SOLVE_ATTEMPTS = 6
-WAIT_PER_ATTEMPT = 4
+WAIT_PER_ATTEMPT = 2
 
 LAST_UA = ""
 
@@ -31,7 +31,7 @@ def _mint() -> tuple[str, str]:
 
     with SB(uc=True, headed=True, locale="en") as sb:
         sb.activate_cdp_mode(START_URL)
-        sb.sleep(2)
+        sb.sleep(1.0)
 
         def read_state() -> tuple[str, str, str, bool]:
             try:
@@ -47,11 +47,11 @@ def _mint() -> tuple[str, str]:
             except Exception:
                 u = ""
             ch = browser_harvest.page_challenged_html(src)
-            return c, u, src, ch
+            ok = browser_harvest.page_passed_html(src)
+            return c, u, ch, ok
 
         while True:
-            cookie, ua, src, challenged = read_state()
-            page_ok = browser_harvest.page_passed_html(src)
+            cookie, ua, challenged, page_ok = read_state()
 
             if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
                 break
@@ -66,24 +66,17 @@ def _mint() -> tuple[str, str]:
                 if not prompt_shown:
                     prompt_shown = True
                     print(
-                        "\n>>> Captcha detected — solve it in the Chrome window.\n"
-                        "    (If a second captcha appears, solve that too.)\n",
+                        "\n>>> Captcha — solve it in Chrome (including a second step if shown).\n",
                         flush=True,
                     )
                 elif tracker.should_print_second_hint():
-                    print(
-                        ">>> Another captcha step appeared — please solve it too.\n",
-                        flush=True,
-                    )
-            elif tracker.should_print_wait_hint():
-                print(
-                    ">>> First captcha cleared — waiting a few seconds in case another appears...\n",
-                    flush=True,
-                )
+                    print(">>> Second captcha — please solve it too.\n", flush=True)
             elif not tracker.captcha_seen and time.monotonic() > fast_deadline:
                 break
 
-            sb.sleep(WAIT_PER_ATTEMPT if tracker.captcha_seen else browser_harvest.POLL_INTERVAL)
+            sb.sleep(
+                WAIT_PER_ATTEMPT if tracker.captcha_seen else browser_harvest.POLL_INTERVAL
+            )
 
     return cookie.strip(), ua.strip()
 
