@@ -97,6 +97,8 @@ class CookiePool:
         self._stop = threading.Event()
         if prefill > 0:
             self._prefill_sync(prefill)
+        elif COOKIE and "datadome=" in COOKIE:
+            print("Cookie pool: using session cookie (no prefill on manual Mac).\n", flush=True)
         self._need_fill.set()
         self._thread = threading.Thread(target=self._maintainer, daemon=True, name="cookie-pool")
         self._thread.start()
@@ -503,12 +505,15 @@ def main() -> int:
                     help="Concurrent download workers (default 1; rate is the real ceiling)")
     ap.add_argument("--rate", type=float, default=platform_util.default_rate(),
                     help="Max total requests/sec across all workers")
-    ap.add_argument("--prefill", type=int, default=3,
-                    help="Spare cookies to harvest before downloading (default 3)")
+    ap.add_argument("--prefill", type=int, default=None,
+                    help="Spare cookies before downloading (default 3 silent, 0 on manual Mac)")
     args = ap.parse_args()
 
     cs.OUT_ROOT = Path(args.out)
-    pool = CookiePool(workers=args.workers, prefill=max(0, args.prefill))
+    prefill = args.prefill
+    if prefill is None:
+        prefill = 3 if auto_refresh.can_background_harvest() else 0
+    pool = CookiePool(workers=args.workers, prefill=max(0, prefill))
     limiter = RateLimiter(args.rate)
 
     jurisdictions = list(cs.JURISDICTIONS.keys()) if args.juris == "all" else [args.juris]

@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Automated CanLII cookie minter using SeleniumBase CDP (stealth) mode.
-
-Tries auto-solve when Screen Recording + Accessibility are granted.
-Otherwise (or if auto-solve fails) keeps Chrome open until you solve the
-slider manually — window closes only after pass or when no captcha appears.
-"""
+"""Automated CanLII cookie minter using SeleniumBase CDP (stealth) mode."""
 from __future__ import annotations
 
 import re
@@ -25,7 +20,6 @@ LAST_UA = ""
 
 
 def _mint() -> tuple[str, str]:
-    """Launch stealth Chrome; close only when no captcha or captcha solved."""
     from seleniumbase import SB
 
     cookie = ""
@@ -39,27 +33,27 @@ def _mint() -> tuple[str, str]:
         sb.activate_cdp_mode(START_URL)
         sb.sleep(2)
 
-        def page_src() -> str:
+        def read_cookie() -> tuple[str, str, str, bool]:
             try:
-                return sb.cdp.get_page_source() or ""
+                src = sb.cdp.get_page_source() or ""
             except Exception:
-                return ""
+                src = ""
+            try:
+                c = sb.cdp.evaluate("document.cookie") or ""
+            except Exception:
+                c = ""
+            try:
+                u = sb.cdp.evaluate("navigator.userAgent") or ""
+            except Exception:
+                u = ""
+            ch = browser_harvest.page_challenged_html(src)
+            return c, u, src, ch
 
         while True:
-            src = page_src()
-            if browser_harvest.page_passed_html(src):
-                try:
-                    cookie = sb.cdp.evaluate("document.cookie") or ""
-                except Exception:
-                    cookie = ""
-                try:
-                    ua = sb.cdp.evaluate("navigator.userAgent") or ""
-                except Exception:
-                    ua = ""
-                if "datadome=" in cookie:
-                    break
-
-            if browser_harvest.page_challenged_html(src):
+            cookie, ua, src, challenged = read_cookie()
+            if browser_harvest.cookie_ready(cookie, challenged=challenged) and browser_harvest.page_passed_html(src):
+                break
+            if challenged:
                 captcha_seen = True
                 if auto_attempts < SOLVE_ATTEMPTS:
                     auto_attempts += 1
@@ -70,13 +64,14 @@ def _mint() -> tuple[str, str]:
                 if not prompt_shown:
                     prompt_shown = True
                     print(
-                        "\n>>> Captcha detected — solve the slider in the Chrome window.\n"
-                        "    (Window stays open until you pass.)\n",
+                        "\n>>> Captcha detected — solve it in the Chrome window.\n"
+                        "    (Solve any sliders/checkboxes shown; window closes when done.)\n",
                         flush=True,
                     )
+            elif browser_harvest.cookie_ready(cookie, challenged=False):
+                break
             elif not captcha_seen and time.monotonic() > fast_deadline:
                 break
-
             sb.sleep(WAIT_PER_ATTEMPT if captcha_seen else browser_harvest.POLL_INTERVAL)
 
     return cookie.strip(), ua.strip()

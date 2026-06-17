@@ -95,9 +95,25 @@ tell application "Google Chrome"
 end tell
 '''
 
+AS_CLOSE_INCOGNITO = '''
+tell application "Google Chrome"
+  repeat with w in (every window)
+    try
+      if mode of w is "incognito" then close w
+    end try
+  end repeat
+end tell
+'''
+
+
+def _close_stale_harvest_windows() -> None:
+    """Close leftover incognito CanLII windows so only one harvest runs at a time."""
+    if platform_util.has_osascript():
+        _run_as(AS_CLOSE_INCOGNITO, quiet=True)
+
 
 def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None) -> str:
-    """macOS: incognito window; close only when no captcha or captcha solved."""
+    """macOS: one incognito window; close only when no captcha or captcha solved."""
     global LAST_MAC_NOJS
     LAST_MAC_NOJS = False
     if not platform_util.has_osascript() or not platform_util.chrome_macos_installed():
@@ -105,6 +121,7 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
         return ""
 
     with _harvest_lock:
+        _close_stale_harvest_windows()
         if not quiet:
             print("\n>>> Opening Chrome incognito...", flush=True)
         raw_idx = _run_as(AS_OPEN, quiet=quiet).strip()
@@ -140,6 +157,9 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
         while True:
             raw = _run_as(_as_poll(win_idx), quiet=True)
             cookie, passed, challenged = browser_harvest.parse_poll(raw)
+            if browser_harvest.cookie_ready(cookie, challenged=challenged):
+                passed = True
+                break
             if passed and "datadome=" in cookie:
                 break
             if challenged:
@@ -150,16 +170,21 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
                 if not prompt_shown:
                     prompt_shown = True
                     print(
-                        ">>> Captcha detected — solve the slider in Chrome.\n"
-                        "    (Window stays open until you pass; closes automatically after.)\n",
+                        ">>> Captcha detected — solve it in Chrome.\n"
+                        "    (Solve any sliders/checkboxes; window closes when done.)\n",
                         flush=True,
                     )
             elif not captcha_seen and time.monotonic() > no_captcha_deadline:
+                if browser_harvest.cookie_ready(cookie, challenged=False):
+                    passed = True
+                    break
                 break
             time.sleep(MAC_POLL_INTERVAL)
 
-        # Close only on success or when no captcha ever appeared.
         if passed or not captcha_seen:
+            _run_as(AS_CLOSE % win_idx, quiet=True)
+        elif browser_harvest.cookie_ready(cookie, challenged=False):
+            passed = True
             _run_as(AS_CLOSE % win_idx, quiet=True)
 
     if passed and cookie and "datadome=" in cookie:
@@ -171,6 +196,7 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
 
 def harvest_cookie_browser(*, try_auto: bool = False, quiet: bool = False) -> str:
     global LAST_UA
+    _close_stale_harvest_windows()
     cookie, ua = browser_harvest.harvest_cookie_interactive(
         try_auto_solve=try_auto, quiet=quiet,
     )
@@ -252,7 +278,7 @@ def harvest_cookie_pool(*, quiet: bool = False) -> str:
 
 
 def harvest_cookie() -> str:
-    """Harvest a validated cookie: AppleScript -> manual browser -> auto-solve last."""
+    """Harvest a validated cookie — one window at a time."""
     global LAST_UA
     LAST_UA = ""
 
@@ -264,14 +290,14 @@ def harvest_cookie() -> str:
             if "datadome=" in cookie:
                 return cookie
             if not LAST_MAC_NOJS:
+                # AppleScript window was waiting or failed — do not open a second browser.
                 return ""
 
-    # Manual browser path — window stays open until captcha solved (no auto-solve needed).
+    # SeleniumBase path (Apple Events unavailable).
     cookie = harvest_cookie_browser(try_auto=False)
     if "datadome=" in cookie:
         return cookie
 
-    # Optional auto-solve only when Screen Recording + Accessibility are granted.
     if auto_solve_capable():
         try:
             import sb_mint

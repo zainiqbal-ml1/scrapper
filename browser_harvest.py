@@ -2,7 +2,6 @@
 
 Shared pass/captcha detection used by AppleScript and SeleniumBase paths.
 Window closes only when CanLII loads with no captcha, or after captcha is solved.
-If a captcha is shown, the window stays open until the user passes it.
 """
 from __future__ import annotations
 
@@ -11,18 +10,21 @@ import time
 
 START_URL = "https://www.canlii.org/en/on/"
 POLL_INTERVAL = 0.4
-FAST_EXIT_NO_CAPTCHA = 15   # seconds: give up only when no captcha ever appeared
+FAST_EXIT_NO_CAPTCHA = 20   # seconds: only when no captcha ever appeared
 
-# One JS snippet for AppleScript + CDP: "cookie|||passed|||challenged"
+# AppleScript + CDP poll: "cookie|||passed|||challenged"
 POLL_JS = (
     "(()=>{"
     "const txt=(document.body&&document.body.innerText||'').toLowerCase();"
     "const html=(document.documentElement&&document.documentElement.innerHTML||'').toLowerCase();"
-    "const challenged=txt.includes('captcha')||txt.includes('proceed with our captcha')"
-    "||html.includes('captcha-delivery');"
     "const c=document.cookie||'';"
-    "const passed=!challenged&&c.includes('datadome=')"
-    "&&(document.title.includes('CanLII')||txt.includes('canlii')||txt.includes('court of appeal'));"
+    "const hasDD=c.includes('datadome=');"
+    "const ddBlock=html.includes('captcha-delivery')||html.includes('geo.captcha-delivery.com')"
+    "||(txt.includes('please enable js')&&html.includes('datadome')&&!txt.includes('canlii'));"
+    "const canliiBlock=txt.includes('proceed with our captcha')||txt.includes('calls upon users accessing');"
+    "const challenged=ddBlock||canliiBlock;"
+    "const onCanlii=document.title.includes('CanLII')||txt.includes('canlii')||location.hostname.includes('canlii');"
+    "const passed=hasDD&&!challenged&&onCanlii;"
     "return c+'|||'+(passed?'1':'0')+'|||'+(challenged?'1':'0');"
     "})()"
 )
@@ -37,34 +39,27 @@ def parse_poll(raw: str) -> tuple[str, bool, bool]:
     return cookie, passed, challenged
 
 
-def page_passed_html(src: str) -> bool:
-    """True when HTML looks like a validated CanLII page (no captcha)."""
-    low = (src or "").lower()
-    if "captcha-delivery" in low or "proceed with our captcha" in low:
-        return False
-    if "please enable js" in low and "datadome" in low:
-        return False
-    return "canlii" in low and ("court of appeal" in low or "canlii.org" in low)
-
-
 def page_challenged_html(src: str) -> bool:
     low = (src or "").lower()
-    return (
-        "captcha-delivery" in low
-        or "proceed with our captcha" in low
-        or ("captcha" in low and "datadome" in low)
-    )
+    if "captcha-delivery" in low or "geo.captcha-delivery.com" in low:
+        return True
+    if "proceed with our captcha" in low or "calls upon users accessing" in low:
+        return True
+    if "please enable js" in low and "datadome" in low and "canlii" not in low[:2000]:
+        return True
+    return False
 
 
-def _captcha_prompt_once(*, quiet: bool, shown: list[bool]) -> None:
-    if quiet or shown[0]:
-        return
-    shown[0] = True
-    print(
-        "\n>>> Captcha detected — solve the slider in the Chrome window.\n"
-        "    (Window stays open until you pass; closes automatically after.)\n",
-        flush=True,
-    )
+def page_passed_html(src: str) -> bool:
+    low = (src or "").lower()
+    if page_challenged_html(src):
+        return False
+    return "canlii" in low
+
+
+def cookie_ready(cookie: str, *, challenged: bool) -> bool:
+    """True when document.cookie has a validated datadome and no active challenge."""
+    return bool(cookie) and "datadome=" in cookie and not challenged
 
 
 def harvest_cookie_interactive(
@@ -78,7 +73,7 @@ def harvest_cookie_interactive(
     cookie = ""
     ua = ""
     captcha_seen = False
-    prompt_shown = [False]
+    prompt_shown = False
     if not quiet:
         print("\n>>> Opening Chrome...", flush=True)
 
@@ -92,26 +87,34 @@ def harvest_cookie_interactive(
                 src = sb.cdp.get_page_source() or ""
             except Exception:
                 src = ""
-
-            if page_passed_html(src):
-                try:
-                    cookie = sb.cdp.evaluate("document.cookie") or ""
-                    ua = sb.cdp.evaluate("navigator.userAgent") or ""
-                except Exception:
-                    cookie = ua = ""
-                if "datadome=" in cookie:
-                    break
-
             challenged = page_challenged_html(src)
+
+            try:
+                cookie = sb.cdp.evaluate("document.cookie") or ""
+                ua = sb.cdp.evaluate("navigator.userAgent") or ""
+            except Exception:
+                cookie = ua = ""
+
+            if cookie_ready(cookie, challenged=challenged) and page_passed_html(src):
+                break
+
             if challenged:
                 captcha_seen = True
-                _captcha_prompt_once(quiet=quiet, shown=prompt_shown)
+                if not prompt_shown:
+                    prompt_shown = True
+                    print(
+                        "\n>>> Captcha detected — solve it in the Chrome window.\n"
+                        "    (Solve any sliders/checkboxes shown; window closes when done.)\n",
+                        flush=True,
+                    )
                 if try_auto_solve:
                     try:
                         sb.cdp.solve_captcha()
                     except Exception as e:
                         if not quiet:
                             print(f"[browser] auto-solve: {e}", file=sys.stderr)
+            elif cookie_ready(cookie, challenged=False):
+                break
             elif not captcha_seen and time.monotonic() > fast_deadline:
                 if not quiet:
                     print(">>> Page did not load in time (no captcha seen).", flush=True)
