@@ -21,7 +21,6 @@ import sys
 
 import bootstrap
 bootstrap.ensure_session_file()
-bootstrap.warn_if_macos_venv_on_linux()
 
 import platform_util
 

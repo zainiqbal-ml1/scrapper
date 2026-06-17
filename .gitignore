@@ -1,3 +1,6 @@
+# local virtualenv
+.venv/
+
 # scraped output - never commit
 data/
 
