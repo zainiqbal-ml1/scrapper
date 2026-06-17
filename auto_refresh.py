@@ -68,10 +68,10 @@ tell application "Google Chrome"
   try
     set t to active tab of window {win_idx}
     set c to execute t javascript "document.cookie"
-    set challenged to execute t javascript "{CHALLENGE_JS}"
-    return c & "|||" & challenged
+    set passed to execute t javascript "{PASS_JS}"
+    return c & "|||" & passed
   on error
-    return "|||1"
+    return "|||0"
   end try
 end tell
 '''
@@ -99,8 +99,8 @@ tell application "Google Chrome"
     try
       if mode of w is "incognito" then
         set c to execute active tab of w javascript "document.cookie"
-        set challenged to execute active tab of w javascript "{CHALLENGE_JS}"
-        if c contains "datadome=" and challenged is not "1" then return c
+        set passed to execute active tab of w javascript "{PASS_JS}"
+        if c contains "datadome=" and passed is "1" then return c
       end if
     end try
   end repeat
@@ -255,17 +255,21 @@ def harvest_cookie_macos(
             return ""
 
         cookie = ""
+        passed = "0"
         deadline = time.monotonic() + timeout_s
         last_note = time.monotonic()
         activated = False
         while time.monotonic() < deadline:
             raw = _run_as(_as_poll_window(win_idx), quiet=True)
-            parts = (raw or "|||1").split("|||", 1)
+            parts = (raw or "|||0").split("|||", 1)
             cookie = parts[0].strip() if parts else ""
-            challenged = parts[1].strip() if len(parts) > 1 else "1"
-            if "datadome=" in cookie and challenged != "1":
+            passed = parts[1].strip() if len(parts) > 1 else "0"
+            # Only accept once the REAL CanLII page has loaded (passed == "1").
+            # DataDome sets a `datadome` cookie on the unsolved challenge page
+            # too, so a cookie alone is not proof the captcha was solved.
+            if passed == "1" and "datadome=" in cookie:
                 break
-            if challenged == "1" and not activated:
+            if passed != "1" and not activated:
                 # Bring the window to the front ONCE so it doesn't steal focus
                 # every poll while you're solving the captcha.
                 _run_as(AS_ACTIVATE_WINDOW % win_idx, quiet=True)
@@ -276,11 +280,11 @@ def harvest_cookie_macos(
                       f"({remaining}s left)", flush=True)
                 last_note = time.monotonic()
             time.sleep(MAC_POLL_INTERVAL)
-        if "datadome=" in cookie or not keep_open:
+        if (passed == "1" and "datadome=" in cookie) or not keep_open:
             _run_as(AS_CLOSE_WINDOW % win_idx, quiet=True)
-    if cookie and "datadome=" in cookie and not quiet:
+    if cookie and "datadome=" in cookie and passed == "1" and not quiet:
         print(">>> Cookie captured.\n", flush=True)
-    return cookie.strip() if "datadome=" in cookie else ""
+    return cookie.strip() if (passed == "1" and "datadome=" in cookie) else ""
 
 
 def harvest_cookie_browser(try_auto: bool = False) -> str:
