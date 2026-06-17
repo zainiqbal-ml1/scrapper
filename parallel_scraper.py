@@ -324,16 +324,25 @@ def _download_year_with_retries(
     records: list[dict],
     workers: int,
     label: str,
-    max_retry_rounds: int = 3,
+    max_retry_rounds: int = 0,
 ) -> tuple[int, int]:
-    """Download all tasks, retry failures, update records. Returns (ok, fail)."""
+    """Download all tasks, retry failures, update records. Returns (ok, fail).
+
+    max_retry_rounds:
+      - 0 => retry until everything succeeds (recommended)
+      - N => stop after N retry rounds
+    """
     ok, failed = _run_downloads(pool, limiter, tasks, workers, label)
     round_no = 0
-    while failed and round_no < max_retry_rounds:
+    while failed and (max_retry_rounds <= 0 or round_no < max_retry_rounds):
         round_no += 1
-        print(f"  {label}: retrying {len(failed)} failed (round {round_no}/{max_retry_rounds})...")
+        suffix = f"{round_no}/{max_retry_rounds}" if max_retry_rounds > 0 else f"{round_no}"
+        print(f"  {label}: retrying {len(failed)} failed (round {suffix})...")
         ok2, failed = _run_downloads(pool, limiter, failed, workers, f"{label} retry")
         ok += ok2
+        if failed:
+            # Keep pressure low while still pushing toward zero failed.
+            time.sleep(0.5)
 
     # Sync record file/error fields with what actually landed on disk.
     out = cs.OUT_ROOT

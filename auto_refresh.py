@@ -26,14 +26,21 @@ START_URL = browser_harvest.START_URL
 POLL_INTERVAL = browser_harvest.POLL_INTERVAL
 POLL_TRIES = browser_harvest.POLL_TRIES
 PASS_JS = "document.body && document.body.innerText.indexOf('Court of Appeal for Ontario')>-1 ? '1':'0'"
+CHALLENGE_JS = (
+    "(()=>{"
+    "const txt=(document.body&&document.body.innerText||'').toLowerCase();"
+    "const html=(document.documentElement&&document.documentElement.innerHTML||'').toLowerCase();"
+    "return (txt.includes('captcha')||txt.includes('proceed with our captcha')||html.includes('captcha-delivery'))?'1':'0';"
+    "})()"
+)
 
 APPLESCRIPT = '''
 tell application "Google Chrome"
-  activate
   set w to make new window with properties {mode:"incognito"}
   set URL of active tab of w to "%s"
 end tell
 set grabbed to ""
+set focused to false
 repeat %d times
   delay %d
   tell application "Google Chrome"
@@ -42,6 +49,16 @@ repeat %d times
     on error
       set passed to "0"
     end try
+    try
+      set challenged to execute active tab of w javascript "%s"
+    on error
+      set challenged to "0"
+    end try
+    if challenged is "1" and focused is false then
+      activate
+      set index of w to 1
+      set focused to true
+    end if
     if passed is "1" then
       try
         set grabbed to execute active tab of w javascript "document.cookie"
@@ -56,7 +73,7 @@ tell application "Google Chrome"
   end try
 end tell
 return grabbed
-''' % (START_URL, POLL_TRIES, POLL_INTERVAL, PASS_JS)
+''' % (START_URL, POLL_TRIES, POLL_INTERVAL, PASS_JS, CHALLENGE_JS)
 
 
 def run_applescript() -> str:
