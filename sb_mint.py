@@ -21,16 +21,15 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 from pathlib import Path
 
 import bootstrap
+import browser_harvest
 
 SESSION_FILE = Path("session.py")
 COOKIE_STATE = Path(".cookie_state.json")
-START_URL = "https://www.canlii.org/en/on/"
-# The real Ontario page lists this; its presence means every captcha
-# (DataDome slider + CanLII native) is cleared and the cookie is validated.
-PASS_TEXT = "Court of Appeal for Ontario"
+START_URL = browser_harvest.START_URL
 SOLVE_ATTEMPTS = 6      # each attempt: solve_captcha() + wait
 WAIT_PER_ATTEMPT = 4    # seconds
 
@@ -46,7 +45,7 @@ def _mint() -> tuple[str, str]:
     ua = ""
     with SB(uc=True, headed=True, locale="en") as sb:
         sb.activate_cdp_mode(START_URL)
-        sb.sleep(5)
+        sb.sleep(2)
 
         def page_src() -> str:
             try:
@@ -54,16 +53,24 @@ def _mint() -> tuple[str, str]:
             except Exception:
                 return ""
 
+        captcha_seen = False
+        fast_deadline = time.monotonic() + browser_harvest.FAST_EXIT_NO_CAPTCHA
+
         for i in range(SOLVE_ATTEMPTS):
-            if PASS_TEXT in page_src():
+            src = page_src()
+            if browser_harvest.page_passed_html(src):
                 break
-            try:
-                sb.cdp.solve_captcha()
-            except Exception as e:
-                print(f"[sb_mint] solve attempt {i + 1} error: {e}", file=sys.stderr)
+            if browser_harvest.page_challenged_html(src):
+                captcha_seen = True
+                try:
+                    sb.cdp.solve_captcha()
+                except Exception as e:
+                    print(f"[sb_mint] solve attempt {i + 1} error: {e}", file=sys.stderr)
+            elif not captcha_seen and time.monotonic() > fast_deadline:
+                break
             sb.sleep(WAIT_PER_ATTEMPT)
 
-        if PASS_TEXT in page_src():
+        if browser_harvest.page_passed_html(page_src()):
             try:
                 cookie = sb.cdp.evaluate("document.cookie") or ""
             except Exception:

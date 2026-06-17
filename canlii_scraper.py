@@ -162,7 +162,6 @@ def fetch(session: requests.Session, url: str, *, tries: int = 5, referer: str |
     """
     headers = {"referer": referer} if referer else None
     net_err = 0
-    challenge_seen = 0
     while True:
         try:
             r = session.get(url, headers=headers)
@@ -170,7 +169,6 @@ def fetch(session: requests.Session, url: str, *, tries: int = 5, referer: str |
             net_err += 1
             if net_err > tries:
                 raise RuntimeError(f"Failed after {tries} network errors: {url} ({e})")
-            time.sleep(1.5 * net_err)
             continue
 
         if r.status_code == 429:
@@ -182,12 +180,6 @@ def fetch(session: requests.Session, url: str, *, tries: int = 5, referer: str |
             )
 
         if _is_challenge(r):
-            # A 403 challenge means the cookie is burned - fail fast. Allow just
-            # one quick retry in case of a momentary soft-block.
-            challenge_seen += 1
-            if challenge_seen == 1:
-                time.sleep(2)
-                continue
             raise SessionExpired(
                 f"DataDome challenge (HTTP {r.status_code}) for {url}.\n"
                 "  -> Refresh your session (solve the slider) and it will resume."

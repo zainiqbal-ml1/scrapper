@@ -44,24 +44,11 @@ def _reload_session() -> None:
     cs.HEADERS = _s.HEADERS
 
 
-def _harvest_one_window(juris: str) -> str:
-    """Open ONE Chrome window and keep it open until the captcha is solved."""
-    if platform_util.has_osascript() and platform_util.chrome_macos_installed():
-        cookie = auto_refresh.harvest_cookie_macos(keep_open=True)
-        if cookie and "datadome=" in cookie:
-            return cookie
-        if auto_refresh.LAST_MAC_NOJS:
-            platform_util.set_apple_events_works(False)
-        elif not auto_refresh.LAST_MAC_NOJS:
-            return ""
-    return auto_refresh.harvest_cookie_browser()
-
-
 def refresh_until_valid(juris: str) -> bool:
     """Refresh the session until check_session passes (one window at a time)."""
     print("\nSession blocked — need a fresh cookie.\n", flush=True)
     while True:
-        cookie = _harvest_one_window(juris)
+        cookie = auto_refresh.harvest_cookie()
         if cookie and "datadome=" in cookie:
             auto_refresh.update_session_cookie(cookie, getattr(auto_refresh, "LAST_UA", ""))
             _reload_session()

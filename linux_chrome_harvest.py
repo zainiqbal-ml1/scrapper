@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import time
 
-from browser_harvest import PASS_TEXT, START_URL
+from browser_harvest import START_URL, page_passed_html
 
 POLL_INTERVAL = 0.5
 POLL_TRIES = 120  # ~60s
@@ -28,7 +28,7 @@ def find_chrome() -> str | None:
 
 def _page_passed(driver) -> bool:
     try:
-        return PASS_TEXT in (driver.page_source or "")
+        return page_passed_html(driver.page_source or "")
     except Exception:
         return False
 

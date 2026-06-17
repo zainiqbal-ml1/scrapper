@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Auto-refresh the CanLII session via a real Chrome window.
 
-macOS: opens incognito Chrome via AppleScript (or SeleniumBase fallback).
-Linux/Windows: opens Chrome via SeleniumBase (no osascript).
-
-You solve any captcha in the window; cookies are read automatically.
+macOS: incognito Chrome via AppleScript (fast, auto-close when cookie captured).
+Linux/Windows / Mac without Apple Events: SeleniumBase (auto-solve if permitted).
 """
 from __future__ import annotations
 
@@ -24,24 +22,27 @@ SESSION_FILE = Path("session.py")
 COOKIE_STATE = Path(".cookie_state.json")
 AUTO_CAP_CACHE = Path(".auto_solve_capable")
 START_URL = browser_harvest.START_URL
-POLL_INTERVAL = browser_harvest.POLL_INTERVAL
-POLL_TRIES = browser_harvest.POLL_TRIES
-PASS_JS = "document.body && document.body.innerText.indexOf('Court of Appeal for Ontario')>-1 ? '1':'0'"
-CHALLENGE_JS = (
-    "(()=>{"
-    "const txt=(document.body&&document.body.innerText||'').toLowerCase();"
-    "const html=(document.documentElement&&document.documentElement.innerHTML||'').toLowerCase();"
-    "return (txt.includes('captcha')||txt.includes('proceed with our captcha')||html.includes('captcha-delivery'))?'1':'0';"
-    "})()"
-)
-# Shorter poll when driven from Python (see harvest_cookie_macos).
-MAC_POLL_INTERVAL = 0.5
-MAC_POLL_TRIES = 120  # ~60s
-MAC_KEEP_TIMEOUT = 600  # 10 min — keep the window open while you solve the captcha
+POLL_JS = browser_harvest.POLL_JS
 
-# Set True when AppleScript opened a window but Chrome refused to run JS via
-# Apple Events (so the caller knows to fall back to SeleniumBase instead).
+MAC_POLL_INTERVAL = 0.4
+
+# Set when Chrome blocks AppleScript JS (fall back to SeleniumBase).
 LAST_MAC_NOJS = False
+
+_harvest_lock = threading.Lock()
+
+
+def _run_as(script: str, *, quiet: bool = False) -> str:
+    if not platform_util.has_osascript():
+        return ""
+    proc = subprocess.run(["osascript", "-e", script], text=True, capture_output=True)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        if err and not quiet:
+            print(f"[osascript] {err}", file=sys.stderr, flush=True)
+        return ""
+    return proc.stdout.strip()
+
 
 AS_OPEN = f'''
 tell application "Google Chrome"
@@ -62,21 +63,22 @@ tell application "Google Chrome"
 end tell
 '''
 
-def _as_poll_window(win_idx: int) -> str:
+
+def _as_poll(win_idx: int) -> str:
+    js = POLL_JS.replace('"', '\\"')
     return f'''
 tell application "Google Chrome"
   try
     set t to active tab of window {win_idx}
-    set c to execute t javascript "document.cookie"
-    set passed to execute t javascript "{PASS_JS}"
-    return c & "|||" & passed
+    return execute t javascript "{js}"
   on error
-    return "|||0"
+    return "|||0|||0"
   end try
 end tell
 '''
 
-AS_ACTIVATE_WINDOW = '''
+
+AS_ACTIVATE = '''
 tell application "Google Chrome"
   try
     activate
@@ -85,7 +87,7 @@ tell application "Google Chrome"
 end tell
 '''
 
-AS_CLOSE_WINDOW = '''
+AS_CLOSE = '''
 tell application "Google Chrome"
   try
     close window %s
@@ -93,225 +95,91 @@ tell application "Google Chrome"
 end tell
 '''
 
-AS_SCAN_INCOGNITO = f'''
-tell application "Google Chrome"
-  repeat with w in windows
-    try
-      if mode of w is "incognito" then
-        set c to execute active tab of w javascript "document.cookie"
-        set passed to execute active tab of w javascript "{PASS_JS}"
-        if c contains "datadome=" and passed is "1" then return c
-      end if
-    end try
-  end repeat
-end tell
-return ""
-'''
 
-_harvest_lock = threading.Lock()
+def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None) -> str:
+    """macOS: incognito window, auto-capture cookie, close when done.
 
-
-def _run_as(script: str, *, quiet: bool = False) -> str:
-    if not platform_util.has_osascript():
-        return ""
-    proc = subprocess.run(
-        ["osascript", "-e", script], text=True, capture_output=True
-    )
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        if err and not quiet:
-            print(f"[osascript] {err}", file=sys.stderr, flush=True)
-        return ""
-    return proc.stdout.strip()
-
-
-# Legacy single-shot script (kept for reference; harvest_cookie_macos uses AS_* above).
-APPLESCRIPT = '''
-tell application "Google Chrome"
-  set w to make new window with properties {mode:"incognito"}
-  set URL of active tab of w to "%s"
-end tell
-set grabbed to ""
-set focused to false
-repeat %d times
-  delay %d
-  tell application "Google Chrome"
-    try
-      set passed to execute active tab of w javascript "%s"
-    on error
-      set passed to "0"
-    end try
-    try
-      set challenged to execute active tab of w javascript "%s"
-    on error
-      set challenged to "0"
-    end try
-    if challenged is "1" and focused is false then
-      activate
-      set index of w to 1
-      set focused to true
-    end if
-    if passed is "1" then
-      try
-        set grabbed to execute active tab of w javascript "document.cookie"
-      end try
-      if grabbed contains "datadome=" then exit repeat
-    end if
-  end tell
-end repeat
-tell application "Google Chrome"
-  try
-    close w
-  end try
-end tell
-return grabbed
-''' % (START_URL, POLL_TRIES, POLL_INTERVAL, PASS_JS, CHALLENGE_JS)
-
-
-def run_applescript() -> str:
-    if not platform_util.has_osascript():
-        return ""
-    proc = subprocess.run(
-        ["osascript", "-"], input=APPLESCRIPT, text=True, capture_output=True
-    )
-    if proc.returncode != 0:
-        print(f"AppleScript error: {proc.stderr.strip()}", file=sys.stderr)
-        return ""
-    return proc.stdout.strip()
-
-
-def poll_incognito_windows(*, quiet: bool = False) -> str:
-    """Read datadome cookie from any open incognito window (no new window)."""
-    if not platform_util.has_osascript():
-        return ""
-    cookie = _run_as(AS_SCAN_INCOGNITO).strip()
-    if cookie and "datadome=" in cookie and not quiet:
-        print(">>> Cookie read from open Chrome window.\n", flush=True)
-    return cookie if "datadome=" in cookie else ""
-
-
-def harvest_cookie_macos(
-    *,
-    quiet: bool = False,
-    keep_open: bool = False,
-    quick: bool = False,
-    timeout_s: float | None = None,
-) -> str:
-    """macOS: open ONE incognito window and keep it open until you solve it.
-
-    Sets module flag LAST_MAC_NOJS=True (and returns "") if Chrome refuses to
-    run JavaScript via Apple Events, so the caller can fall back to SeleniumBase.
-
-    quick: short ~8s probe (used for a quick background check, not for solving).
-    timeout_s: how long to keep the window open while you solve (default 10 min
-    unless quick).
+    Only brings the window to front if a captcha is actually shown.
+    If CanLII loads with no captcha, captures and closes within seconds.
     """
     global LAST_MAC_NOJS
     LAST_MAC_NOJS = False
-    if not platform_util.has_osascript():
-        return ""
-    if not platform_util.chrome_macos_installed():
-        if not quiet:
-            print(
-                "Google Chrome not found in /Applications.\n"
-                "  Install Chrome or the scraper will use SeleniumBase instead.\n",
-                flush=True,
-            )
+    if not platform_util.has_osascript() or not platform_util.chrome_macos_installed():
         LAST_MAC_NOJS = True
         return ""
-    if timeout_s is None:
-        timeout_s = 8.0 if quick else MAC_KEEP_TIMEOUT
+
+    max_wait = timeout_s or browser_harvest.CAPTCHA_TIMEOUT
     with _harvest_lock:
         if not quiet:
-            print(
-                "\n>>> A Chrome incognito window is opening — SOLVE THE CAPTCHA there.\n"
-                f"    It stays open up to {int(timeout_s // 60)} min and closes once you pass.\n",
-                flush=True,
-            )
+            print("\n>>> Opening Chrome incognito...", flush=True)
         raw_idx = _run_as(AS_OPEN, quiet=quiet).strip()
         if not raw_idx.isdigit():
-            if not quiet:
-                print(
-                    "Could not open Chrome via AppleScript "
-                    "(check Automation permission in System Settings > Privacy).\n",
-                    flush=True,
-                )
             LAST_MAC_NOJS = True
+            if not quiet:
+                print("Could not control Chrome (check Automation in System Settings).\n", flush=True)
             return ""
         win_idx = int(raw_idx)
-
-        # Probe: can we run JS in this window via Apple Events?
         time.sleep(1.0)
-        probe = _run_as(AS_PROBE % win_idx, quiet=True).strip()
-        if probe != "PONG":
-            if not quiet:
-                print(
-                    "    Chrome won't allow JavaScript from Apple Events on this Mac.\n"
-                    "    Switching to a SeleniumBase window instead...\n",
-                    flush=True,
-                )
-            _run_as(AS_CLOSE_WINDOW % win_idx, quiet=True)
+        if _run_as(AS_PROBE % win_idx, quiet=True).strip() != "PONG":
+            _run_as(AS_CLOSE % win_idx, quiet=True)
             LAST_MAC_NOJS = True
             platform_util.set_apple_events_works(False)
+            if not quiet:
+                print("Chrome blocks Apple Events — will use SeleniumBase instead.\n", flush=True)
             return ""
         platform_util.set_apple_events_works(True)
 
         cookie = ""
-        passed = "0"
-        deadline = time.monotonic() + timeout_s
-        last_note = time.monotonic()
+        passed = False
+        captcha_seen = False
         activated = False
+        deadline = time.monotonic() + max_wait
+        fast_deadline = time.monotonic() + browser_harvest.FAST_EXIT_NO_CAPTCHA
+
         while time.monotonic() < deadline:
-            raw = _run_as(_as_poll_window(win_idx), quiet=True)
-            parts = (raw or "|||0").split("|||", 1)
-            cookie = parts[0].strip() if parts else ""
-            passed = parts[1].strip() if len(parts) > 1 else "0"
-            # Only accept once the REAL CanLII page has loaded (passed == "1").
-            # DataDome sets a `datadome` cookie on the unsolved challenge page
-            # too, so a cookie alone is not proof the captcha was solved.
-            if passed == "1" and "datadome=" in cookie:
+            raw = _run_as(_as_poll(win_idx), quiet=True)
+            cookie, passed, challenged = browser_harvest.parse_poll(raw)
+            if passed and "datadome=" in cookie:
                 break
-            if passed != "1" and not activated:
-                # Bring the window to the front ONCE so it doesn't steal focus
-                # every poll while you're solving the captcha.
-                _run_as(AS_ACTIVATE_WINDOW % win_idx, quiet=True)
-                activated = True
-            if not quiet and time.monotonic() - last_note >= 30:
-                remaining = int(deadline - time.monotonic())
-                print(f"    still waiting for you to solve the captcha... "
-                      f"({remaining}s left)", flush=True)
-                last_note = time.monotonic()
+            if challenged:
+                captcha_seen = True
+                if not activated:
+                    _run_as(AS_ACTIVATE % win_idx, quiet=True)
+                    activated = True
+                    if not quiet:
+                        print(
+                            ">>> Captcha detected — solve the slider in Chrome.\n"
+                            "    (Window closes automatically when you pass.)\n",
+                            flush=True,
+                        )
+            elif not captcha_seen and time.monotonic() > fast_deadline:
+                break
             time.sleep(MAC_POLL_INTERVAL)
-        if (passed == "1" and "datadome=" in cookie) or not keep_open:
-            _run_as(AS_CLOSE_WINDOW % win_idx, quiet=True)
-    if cookie and "datadome=" in cookie and passed == "1" and not quiet:
-        print(">>> Cookie captured.\n", flush=True)
-    return cookie.strip() if (passed == "1" and "datadome=" in cookie) else ""
+
+        _run_as(AS_CLOSE % win_idx, quiet=True)
+
+    if passed and cookie and "datadome=" in cookie:
+        if not quiet:
+            print(">>> Cookie captured — window closed.\n", flush=True)
+        return cookie.strip()
+    return ""
 
 
-def harvest_cookie_browser(try_auto: bool = False) -> str:
-    """Linux/Windows (and macOS fallback): SeleniumBase headed Chrome."""
+def harvest_cookie_browser(*, try_auto: bool = False, quiet: bool = False) -> str:
     global LAST_UA
-    cookie, ua = browser_harvest.harvest_cookie_interactive(try_auto_solve=try_auto)
+    cookie, ua = browser_harvest.harvest_cookie_interactive(
+        try_auto_solve=try_auto, quiet=quiet,
+    )
     if "datadome=" in cookie:
         LAST_UA = ua
         return cookie
     return ""
 
 
-# Set to the User-Agent that came with the most recently harvested cookie
-# (only the automated SeleniumBase path can report it). Kept in sync so
-# curl_cffi presents the same fingerprint the cookie was minted under.
 LAST_UA = ""
 
 
 def auto_solve_capable() -> bool:
-    """True if PyAutoGUI can screenshot and move the mouse (slider auto-solve).
-
-    On macOS this needs Screen Recording + Accessibility. On Linux/Windows
-    needs a graphical display (DISPLAY / Wayland). Result cached in
-    .auto_solve_capable (delete to re-test).
-    """
     if platform_util.is_linux() and not _has_display():
         return False
     if AUTO_CAP_CACHE.exists():
@@ -324,12 +192,12 @@ def auto_solve_capable() -> bool:
         import pyautogui
 
         pyautogui.FAILSAFE = False
-        pyautogui.screenshot()  # raises / blank without Screen Recording
+        pyautogui.screenshot()
         start = pyautogui.position()
         pyautogui.moveTo(start[0] + 6, start[1] + 6, duration=0.05)
         time.sleep(0.05)
         end = pyautogui.position()
-        pyautogui.moveTo(start[0], start[1], duration=0.05)  # put it back
+        pyautogui.moveTo(start[0], start[1], duration=0.05)
         ok = abs(end[0] - (start[0] + 6)) < 4 and abs(end[1] - (start[1] + 6)) < 4
     except Exception:
         ok = False
@@ -348,11 +216,6 @@ def _has_display() -> bool:
 
 
 def can_background_harvest() -> bool:
-    """True when cookies can be minted without popping a headed browser at the user.
-
-    Linux: system Chrome attach. macOS: only when AppleScript JS works.
-    macOS without Apple Events must use one visible SeleniumBase window on demand.
-    """
     if platform_util.is_linux():
         return True
     if platform_util.has_osascript() and platform_util.apple_events_works():
@@ -360,19 +223,14 @@ def can_background_harvest() -> bool:
     return False
 
 
-def harvest_cookie_pool(*, quiet: bool = False, timeout_s: float = 180) -> str:
-    """Harvest one validated cookie for the download pool."""
+def harvest_cookie_pool(*, quiet: bool = False) -> str:
+    """One cookie for the download pool (silent when AppleScript/Linux fast path works)."""
     global LAST_UA
     LAST_UA = ""
-    if quiet and not can_background_harvest():
-        # Never pop SeleniumBase windows silently in the background on this Mac.
-        return ""
-    if platform_util.has_osascript():
-        cookie = harvest_cookie_macos(keep_open=True, quiet=quiet, timeout_s=timeout_s)
+    if platform_util.has_osascript() and platform_util.apple_events_works():
+        cookie = harvest_cookie_macos(quiet=True, timeout_s=60)
         if "datadome=" in cookie:
             return cookie
-        if not LAST_MAC_NOJS:
-            return ""
     if platform_util.is_linux():
         try:
             from linux_chrome_harvest import harvest_linux_fast
@@ -381,31 +239,19 @@ def harvest_cookie_pool(*, quiet: bool = False, timeout_s: float = 180) -> str:
             if "datadome=" in cookie:
                 LAST_UA = ua
                 return cookie
-        except Exception as e:
-            if not quiet:
-                print(f"[auto_refresh] Linux fast harvest failed ({e}); using SeleniumBase.", file=sys.stderr)
-    if quiet and not can_background_harvest():
+        except Exception:
+            pass
+    if quiet:
         return ""
-    cookie, ua = browser_harvest.harvest_cookie_interactive(
-        try_auto_solve=False, quiet=quiet, timeout_s=timeout_s,
-    )
-    if "datadome=" in cookie:
-        LAST_UA = ua
-        return cookie
-    return ""
+    return harvest_cookie_browser(try_auto=False, quiet=quiet)
 
 
-def harvest_cookie(*, skip_auto_solve: bool = False) -> str:
-    """Return a validated `document.cookie` string, or '' on failure.
-
-    skip_auto_solve: go straight to incognito/browser (used by run.py so we
-    don't block ~30s on sb_mint before opening the window you need to solve).
-    """
+def harvest_cookie() -> str:
+    """Harvest a validated cookie: auto-solve -> AppleScript -> SeleniumBase."""
     global LAST_UA
     LAST_UA = ""
 
-    can_auto = False if skip_auto_solve else auto_solve_capable()
-    if can_auto:
+    if auto_solve_capable():
         try:
             import sb_mint
 
@@ -413,23 +259,20 @@ def harvest_cookie(*, skip_auto_solve: bool = False) -> str:
             if "datadome=" in cookie:
                 LAST_UA = sb_mint.LAST_UA
                 return cookie.strip()
-            print("[auto_refresh] Auto-solve didn't pass; opening browser for you.", file=sys.stderr)
         except Exception as e:
-            print(f"[auto_refresh] Auto-solve unavailable ({e}); opening browser.", file=sys.stderr)
+            print(f"[auto_refresh] Auto-solve failed ({e}); trying browser.", file=sys.stderr)
 
-    # macOS: fast path via AppleScript (incognito, no SeleniumBase startup).
-    if platform_util.has_osascript():
-        cookie = harvest_cookie_macos()
-        if "datadome=" in cookie:
-            return cookie
-        if not LAST_MAC_NOJS:
-            return ""  # window opened fine; user just didn't solve it in time
-        print("[auto_refresh] AppleScript can't run JS; trying SeleniumBase browser.", file=sys.stderr)
+    if platform_util.has_osascript() and platform_util.chrome_macos_installed():
+        ae_cache = platform_util.APPLE_EVENTS_CACHE
+        try_applescript = not ae_cache.exists() or ae_cache.read_text().strip() != "0"
+        if try_applescript:
+            cookie = harvest_cookie_macos()
+            if "datadome=" in cookie:
+                return cookie
+            if not LAST_MAC_NOJS:
+                return ""
 
-    # Linux / Windows / macOS fallback: headed Chrome via SeleniumBase.
-    if platform_util.is_linux():
-        print(f"[auto_refresh] Linux detected — using SeleniumBase ({platform_util.harvest_backend()}).", flush=True)
-    return harvest_cookie_browser(try_auto=can_auto)
+    return harvest_cookie_browser(try_auto=auto_solve_capable())
 
 
 def update_session_cookie(cookie: str, ua: str = "") -> None:
@@ -445,17 +288,13 @@ def update_session_cookie(cookie: str, ua: str = "") -> None:
 
 def main() -> int:
     print(f"Harvest backend: {platform_util.harvest_backend()}")
-    print("Opening a browser window... solve any captcha there.")
-    print("(Waiting up to ~4 min; it auto-detects when you pass.)")
     cookie = harvest_cookie()
     if "datadome=" not in cookie:
-        print("Did not capture a validated cookie (timeout or not solved).", file=sys.stderr)
+        print("Did not capture a validated cookie.", file=sys.stderr)
         return 1
     dd = re.search(r"datadome=([^;]+)", cookie)
     update_session_cookie(cookie.strip(), LAST_UA)
     print(f"Captured fresh session. datadome={dd.group(1)[:24] if dd else '?'}...")
-    if LAST_UA:
-        print(f"User-Agent synced: {LAST_UA[:60]}...")
     return 0
 
 
