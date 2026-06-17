@@ -7,9 +7,8 @@ Same output as canlii_scraper.py:
 
 How it scales (and its limits):
   - Runs N worker threads, each holding its OWN datadome cookie.
-  - A background thread keeps workers+2 fresh cookies queued ahead; harvest
-    starts immediately when the pool drains (no startup wait, no 15s backoff).
-  - Cookies are rotated proactively at ~75 downloads before DataDome burns them.
+  - Up to 3 incognito Chrome windows harvest cookies in parallel to fill the pool.
+  - Workers grab the next cookie instantly on 403/429 (never retry with a burned one).
   - A shared RATE LIMITER caps total requests/sec so the single IP doesn't get
     429'd (parallel workers share one IP, so this is the real ceiling).
   - Failed PDFs are retried up to 3 rounds before moving to the next year.
@@ -44,10 +43,6 @@ class NeedNewCookie(Exception):
     pass
 
 
-class CookieNotReady(Exception):
-    """Pool has no spare cookie right now; retry the download without blocking."""
-
-
 def parse_cookie(cookie_str: str) -> dict:
     jar = {}
     for part in cookie_str.split(";"):
@@ -78,129 +73,134 @@ class RateLimiter:
 
 
 class CookiePool:
-    """Queue of ready cookies; background thread keeps the pool topped up.
+    """Queue of ready cookies; parallel background harvesters keep it full.
 
-    Workers never wait on captcha if a cookie is queued. When the pool drains,
-    harvest is kicked immediately (not on a slow poll loop). Cookies are also
-    rotated proactively before DataDome burns them (~75 requests).
+    Multiple incognito Chrome windows can harvest at once. Workers grab a
+    cookie instantly from the queue on 403/429 — never retry with a burned one.
     """
 
-    COOKIE_BUDGET = 75       # swap out before the ~85-request burn
+    COOKIE_BUDGET = 75
     MIN_READY = 2
-    MAX_RETRIES = 2
-    ACQUIRE_POLL = 0.05      # seconds between queue polls
-    ACQUIRE_MAX_WAIT = 1.5   # never block downloads long; maintainer fills pool
+    MAX_PARALLEL_HARVESTS = 3   # concurrent incognito / browser windows
+    ACQUIRE_POLL = 0.02
+    ACQUIRE_MAX_WAIT = 120
 
     def __init__(self, workers: int = 3):
         self._workers = max(1, workers)
-        # Extra headroom so workers swap instantly while harvest runs in background.
         self.TARGET_READY = max(self.MIN_READY, self._workers + 3)
         self._ready: queue.Queue[str] = queue.Queue()
-        self._harvest_lock = threading.Lock()
-        self._harvesting = threading.Event()
-        self._need_fill = threading.Event()
         self._stop = threading.Event()
-        self._ready.put(COOKIE)  # seed from session.py
-        self._need_fill.set()    # kick first background fill immediately
-        self._thread = threading.Thread(target=self._maintainer, daemon=True, name="cookie-pool")
-        self._thread.start()
+        self._harvests_lock = threading.Lock()
+        self._active_harvests = 0
+        self._harvest_serial = 0
+        self._ready.put(COOKIE)
+        self.kick_fill()
+        self._maintainer = threading.Thread(target=self._maintainer_loop, daemon=True, name="cookie-pool")
+        self._maintainer.start()
 
-    def _harvest(self) -> str:
-        with self._harvest_lock:
-            print("\n>>> Harvesting a fresh cookie (background)...\n", flush=True)
-            for _ in range(self.MAX_RETRIES):
-                cookie = auto_refresh.harvest_cookie()
-                if cookie:
-                    print(">>> Cookie ready.\n", flush=True)
-                    return cookie
-            raise RuntimeError("Could not harvest a fresh cookie (captcha not solved in time).")
+    def _do_harvest(self) -> str:
+        with self._harvests_lock:
+            self._harvest_serial += 1
+            n = self._harvest_serial
+        print(f"\n>>> Harvesting cookie #{n} (parallel window)...\n", flush=True)
+        cookie = auto_refresh.harvest_cookie_pool()
+        if cookie:
+            print(f">>> Cookie #{n} ready (pool has ~{self._ready.qsize() + 1}).\n", flush=True)
+        return cookie
 
-    def _fill_one(self) -> None:
-        if self._stop.is_set() or self._ready.qsize() >= self.TARGET_READY:
-            return
-        if self._harvesting.is_set():
-            return
-        self._harvesting.set()
+    def _harvest_worker(self) -> None:
         try:
-            self._ready.put(self._harvest())
+            if self._stop.is_set():
+                return
+            cookie = self._do_harvest()
+            if cookie and "datadome=" in cookie:
+                self._ready.put(cookie)
         except Exception as e:
             print(f"[cookie-pool] harvest failed: {e}", file=sys.stderr, flush=True)
-            time.sleep(2)
         finally:
-            self._harvesting.clear()
-            self._need_fill.set()
-
-    def try_acquire(self) -> str | None:
-        """Take a cookie if one is queued; never blocks on harvest."""
-        try:
-            cookie = self._ready.get_nowait()
-            self.kick_fill()
-            return cookie
-        except queue.Empty:
-            self.kick_fill()
-            return None
-
-    def acquire(self) -> str:
-        """Take a ready cookie. Raises CookieNotReady instead of blocking on captcha."""
-        cookie = self.try_acquire()
-        if cookie:
-            return cookie
-        deadline = time.monotonic() + self.ACQUIRE_MAX_WAIT
-        while time.monotonic() < deadline:
-            try:
-                cookie = self._ready.get(timeout=self.ACQUIRE_POLL)
+            with self._harvests_lock:
+                self._active_harvests -= 1
+            if not self._stop.is_set():
                 self.kick_fill()
-                return cookie
-            except queue.Empty:
-                continue
-        raise CookieNotReady()
 
-    def _maintainer(self) -> None:
+    def _start_harvests(self) -> None:
+        """Launch as many parallel harvests as needed (up to MAX_PARALLEL_HARVESTS)."""
+        if self._stop.is_set():
+            return
+        with self._harvests_lock:
+            needed = self.TARGET_READY - self._ready.qsize()
+            slots = self.MAX_PARALLEL_HARVESTS - self._active_harvests
+            to_start = min(max(needed, 0), max(slots, 0))
+            for _ in range(to_start):
+                self._active_harvests += 1
+                threading.Thread(
+                    target=self._harvest_worker, daemon=True, name="cookie-harvest"
+                ).start()
+
+    def _maintainer_loop(self) -> None:
         while not self._stop.is_set():
-            self._need_fill.wait(timeout=0.2)
-            self._need_fill.clear()
-            if self._stop.is_set():
-                break
-            while self._ready.qsize() < self.TARGET_READY and not self._stop.is_set():
-                self._fill_one()
+            if self._ready.qsize() < self.TARGET_READY:
+                self._start_harvests()
+            time.sleep(0.15)
 
     def ready_count(self) -> int:
         return self._ready.qsize()
 
     def kick_fill(self) -> None:
-        """Ask the background thread to top up the pool now."""
-        self._need_fill.set()
+        self._start_harvests()
+
+    def acquire(self) -> str:
+        """Take a ready cookie; parallel harvesters refill while you wait."""
+        self.kick_fill()
+        try:
+            return self._ready.get_nowait()
+        except queue.Empty:
+            pass
+        deadline = time.monotonic() + self.ACQUIRE_MAX_WAIT
+        while time.monotonic() < deadline and not self._stop.is_set():
+            self.kick_fill()
+            try:
+                return self._ready.get(timeout=self.ACQUIRE_POLL)
+            except queue.Empty:
+                continue
+        cookie = self._do_harvest()
+        self.kick_fill()
+        return cookie
 
     def stop(self) -> None:
         self._stop.set()
-        self._need_fill.set()
 
 
 _local = threading.local()
+
+
+def _discard_session() -> None:
+    """Drop the worker's burned session so the next request cannot reuse it."""
+    _local.session = None
+
+
+def _swap_cookie(pool: CookiePool, *, reason: str = "") -> requests.Session:
+    used = getattr(_local, "used", 0)
+    if reason or used:
+        print(f"    (fresh cookie from pool{': ' + reason if reason else ''}, had {used} downloads)", flush=True)
+    _discard_session()
+    pool.kick_fill()
+    cookie = pool.acquire()
+    _local.session = requests.Session(
+        impersonate=cs.IMPERSONATE, headers=HEADERS, cookies=parse_cookie(cookie), timeout=60
+    )
+    _local.used = 0
+    return _local.session
 
 
 def get_session(pool: CookiePool, force_new: bool = False) -> requests.Session:
     used = getattr(_local, "used", 0)
     if not force_new and used >= CookiePool.COOKIE_BUDGET:
         force_new = True
-    if force_new or not getattr(_local, "session", None):
-        if force_new and used:
-            print(f"    (cookie swap after {used} downloads)", flush=True)
-        try:
-            cookie = pool.acquire()
-        except CookieNotReady:
-            if getattr(_local, "session", None):
-                return _local.session
-            cookie = None
-            for _ in range(120):
-                time.sleep(0.5)
-                try:
-                    cookie = pool.acquire()
-                    break
-                except CookieNotReady:
-                    pass
-            if not cookie:
-                raise RuntimeError("No cookie available (background harvest failed).")
+    if force_new:
+        return _swap_cookie(pool, reason="proactive rotation")
+    if not getattr(_local, "session", None):
+        cookie = pool.acquire()
         _local.session = requests.Session(
             impersonate=cs.IMPERSONATE, headers=HEADERS, cookies=parse_cookie(cookie), timeout=60
         )
@@ -209,39 +209,48 @@ def get_session(pool: CookiePool, force_new: bool = False) -> requests.Session:
 
 
 def worker_get(pool: CookiePool, limiter: RateLimiter, url: str, referer: str | None):
-    """One GET with rate limiting.
-
-    429: retry with the SAME cookie (brief pause) — don't burn cookies every ~20 req.
-    Captcha/403: swap cookie when the pool has one ready.
-    """
-    s = get_session(pool)
+    """One GET. On 403/captcha or 429: discard cookie and retry once with pool cookie."""
     headers = {"referer": referer} if referer else None
-    rate_waits = 0
-    while True:
+    for cookie_try in range(2):
+        s = get_session(pool)
         limiter.wait()
         try:
             r = s.get(url, headers=headers)
         except Exception:
-            time.sleep(0.3)
-            continue
-        if r.status_code == 429:
-            rate_waits += 1
-            if rate_waits <= 3:
-                time.sleep(1.0 * rate_waits)
+            if cookie_try == 0:
+                _swap_cookie(pool, reason="network error")
                 continue
-            raise NeedNewCookie()
+            raise
+        if r.status_code == 429:
+            _swap_cookie(pool, reason="429 rate limit")
+            continue
         if cs._is_challenge(r):
-            raise NeedNewCookie()
+            _swap_cookie(pool, reason="captcha/block")
+            continue
         return r
+    raise NeedNewCookie()
 
 
 def download_task(pool: CookiePool, limiter: RateLimiter, task: dict) -> tuple[dict, bool, str]:
-    """Download one PDF, refreshing the worker's cookie if it gets blocked."""
+    """Download one PDF; on block/rate-limit swap to pool cookie immediately."""
     dest = Path(task["dest"])
     if dest.exists() and dest.stat().st_size > 0:
         return task, True, "exists"
-    for attempt in range(4):
+    try:
+        r = worker_get(pool, limiter, task["pdf_url"], task["html_url"])
+        if r.status_code != 200:
+            return task, False, f"HTTP {r.status_code}"
+        if not r.content.startswith(b"%PDF"):
+            return task, False, "not a PDF"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(r.content)
+        _local.used = getattr(_local, "used", 0) + 1
+        if _local.used >= CookiePool.COOKIE_BUDGET - 15:
+            pool.kick_fill()
+        return task, True, f"{len(r.content)//1024} KB"
+    except NeedNewCookie:
         try:
+            _swap_cookie(pool, reason="pool exhausted")
             r = worker_get(pool, limiter, task["pdf_url"], task["html_url"])
             if r.status_code != 200:
                 return task, False, f"HTTP {r.status_code}"
@@ -250,16 +259,9 @@ def download_task(pool: CookiePool, limiter: RateLimiter, task: dict) -> tuple[d
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(r.content)
             _local.used = getattr(_local, "used", 0) + 1
-            if _local.used >= CookiePool.COOKIE_BUDGET - 10:
-                pool.kick_fill()  # top up pool before this cookie expires
             return task, True, f"{len(r.content)//1024} KB"
-        except NeedNewCookie:
-            try:
-                get_session(pool, force_new=True)
-            except CookieNotReady:
-                pool.kick_fill()
-                time.sleep(0.3)
-    return task, False, "blocked (gave up after refreshes)"
+        except Exception:
+            return task, False, "blocked (no pool cookie)"
 
 
 def _year_complete(out: Path, juris: str, db: str, year: int) -> bool:
@@ -351,12 +353,12 @@ def _download_year_with_retries(
 
 
 def manager_get(pool: CookiePool, limiter: RateLimiter, url: str, referer: str | None = None):
-    """Used by the main thread for listings; refreshes cookie on block."""
-    for _ in range(4):
+    """Main-thread listings; instant pool swap on block/rate-limit."""
+    for _ in range(2):
         try:
             return worker_get(pool, limiter, url, referer)
         except NeedNewCookie:
-            get_session(pool, force_new=True)
+            _swap_cookie(pool, reason="listing blocked")
     raise RuntimeError(f"Could not fetch {url}")
 
 
@@ -430,8 +432,8 @@ def main() -> int:
     pool = CookiePool(workers=args.workers)
     limiter = RateLimiter(args.rate)
 
-    print(f"Cookie pool: target {pool.TARGET_READY} ready ahead "
-          f"(fills in background while downloading).\n")
+    print(f"Cookie pool: target {pool.TARGET_READY} ready, up to "
+          f"{pool.MAX_PARALLEL_HARVESTS} parallel harvest windows.\n")
 
     jurisdictions = list(cs.JURISDICTIONS.keys()) if args.juris == "all" else [args.juris]
     grand = {"total": 0, "downloaded": 0, "failed": 0}

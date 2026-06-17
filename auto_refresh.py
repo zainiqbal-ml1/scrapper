@@ -72,8 +72,10 @@ def run_applescript() -> str:
 
 
 def harvest_cookie_macos() -> str:
-    """macOS-only: incognito via AppleScript."""
-    print("[auto_refresh] macOS: opening incognito Chrome (AppleScript)...", flush=True)
+    """macOS-only: incognito via AppleScript (one window per call)."""
+    if not platform_util.has_osascript():
+        return ""
+    print("[auto_refresh] macOS: opening incognito Chrome window...", flush=True)
     cookie = run_applescript()
     return cookie.strip() if "datadome=" in cookie else ""
 
@@ -134,6 +136,25 @@ def _has_display() -> bool:
     if platform_util.is_windows():
         return True
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def harvest_cookie_pool() -> str:
+    """Fast harvest for the background cookie pool (skip slow sb_mint).
+
+    Opens an incognito/browser window only. Safe to run several in parallel
+    (each call opens its own window).
+    """
+    global LAST_UA
+    LAST_UA = ""
+    if platform_util.has_osascript():
+        cookie = harvest_cookie_macos()
+        if "datadome=" in cookie:
+            return cookie
+    cookie, ua = browser_harvest.harvest_cookie_interactive(try_auto_solve=False, quiet=True)
+    if "datadome=" in cookie:
+        LAST_UA = ua
+        return cookie
+    return ""
 
 
 def harvest_cookie() -> str:

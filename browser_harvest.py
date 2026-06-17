@@ -14,17 +14,18 @@ POLL_INTERVAL = 3
 POLL_TRIES = 80  # ~4 minutes
 
 
-def harvest_cookie_interactive(*, try_auto_solve: bool = False) -> tuple[str, str]:
+def harvest_cookie_interactive(*, try_auto_solve: bool = False, quiet: bool = False) -> tuple[str, str]:
     """Open Chrome, wait until CanLII loads, return (document.cookie, user_agent)."""
     from seleniumbase import SB
 
     cookie = ""
     ua = ""
-    print(
-        "\n>>> Opening Chrome — solve any captcha in the browser window.\n"
-        "    (Waiting up to ~4 min; closes automatically when done.)\n",
-        flush=True,
-    )
+    if not quiet:
+        print(
+            "\n>>> Opening Chrome — solve any captcha in the browser window.\n"
+            "    (Waiting up to ~4 min; closes automatically when done.)\n",
+            flush=True,
+        )
     with SB(uc=True, headed=True, locale="en") as sb:
         sb.activate_cdp_mode(START_URL)
         sb.sleep(3)
@@ -48,6 +49,6 @@ def harvest_cookie_interactive(*, try_auto_solve: bool = False) -> tuple[str, st
                     if i == 0:
                         print(f"[browser] auto-solve attempt: {e}", file=sys.stderr)
             time.sleep(POLL_INTERVAL)
-    if cookie and "datadome=" in cookie:
+    if cookie and "datadome=" in cookie and not quiet:
         print(">>> Cookie captured from browser.\n", flush=True)
     return cookie.strip(), ua.strip()
