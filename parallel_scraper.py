@@ -10,7 +10,7 @@ How it scales (and its limits):
   - Cookies rotate proactively at ~75 downloads before DataDome burns them.
   - On 429/403 the worker swaps to the next pooled cookie immediately.
   - A shared rate limiter caps total requests/sec.
-  - Failed PDFs retry with fresh cookies (up to 4 attempts each).
+  - Failed PDFs retry up to 3 rounds; permanent errors (404, not a PDF) are not retried.
 
 Examples:
     python parallel_scraper.py --juris on --db all --years all --workers 3
@@ -179,7 +179,10 @@ class CookiePool:
         if COOKIE and COOKIE != current and "datadome=" in COOKIE:
             self.kick_fill()
             return COOKIE
-        return self._harvest(quiet=False)
+        # Pool and session exhausted — harvest once (avoid repeated browser opens per PDF).
+        cookie = self._harvest(quiet=False)
+        self.kick_fill()
+        return cookie
 
     def stop(self) -> None:
         self._stop.set()
@@ -244,6 +247,11 @@ def worker_get(pool: CookiePool, limiter: RateLimiter, url: str, referer: str | 
         return r
 
 
+def _permanent_fail(msg: str) -> bool:
+    """True when retrying with a new cookie cannot help."""
+    return msg.startswith(("HTTP 404", "HTTP 410", "HTTP 451", "not a PDF"))
+
+
 def download_task(pool: CookiePool, limiter: RateLimiter, task: dict) -> tuple[dict, bool, str]:
     dest = Path(task["dest"])
     if dest.exists() and dest.stat().st_size > 0:
@@ -254,18 +262,25 @@ def download_task(pool: CookiePool, limiter: RateLimiter, task: dict) -> tuple[d
             if r.status_code != 200:
                 if r.status_code in (403, 429) or cs._is_challenge(r):
                     raise NeedNewCookie()
-                return task, False, f"HTTP {r.status_code}"
+                msg = f"HTTP {r.status_code}"
+                task["_fail_msg"] = msg
+                return task, False, msg
             if not r.content.startswith(b"%PDF"):
-                return task, False, "not a PDF"
+                msg = "not a PDF"
+                task["_fail_msg"] = msg
+                return task, False, msg
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(r.content)
             _local.used = getattr(_local, "used", 0) + 1
             if _local.used >= CookiePool.COOKIE_BUDGET - 10:
                 pool.kick_fill()
+            task.pop("_fail_msg", None)
             return task, True, f"{len(r.content)//1024} KB"
         except NeedNewCookie:
             get_session(pool, force_new=True)
-    return task, False, "blocked (gave up after refreshes)"
+    msg = "blocked (gave up after refreshes)"
+    task["_fail_msg"] = msg
+    return task, False, msg
 
 
 def _year_complete(out: Path, juris: str, db: str, year: int) -> bool:
@@ -308,10 +323,11 @@ def _run_downloads(
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(download_task, pool, limiter, t) for t in tasks]
         for fut in as_completed(futs):
-            task, got, _msg = fut.result()
+            task, got, msg = fut.result()
             if got:
                 ok += 1
             else:
+                task["_fail_msg"] = msg
                 failed.append(task)
             done += 1
             bar = (f"  {label}: [{done}/{total}] ok={ok} fail={len(failed)} "
@@ -322,6 +338,18 @@ def _run_downloads(
     return ok, failed
 
 
+def _print_failures(label: str, failed: list[dict]) -> None:
+    if not failed:
+        return
+    print(f"  {label}: {len(failed)} could not download:", flush=True)
+    for t in failed[:8]:
+        cite = t.get("citation", "?")
+        msg = t.get("_fail_msg", "unknown")
+        print(f"    - {cite}: {msg}", flush=True)
+    if len(failed) > 8:
+        print(f"    ... and {len(failed) - 8} more", flush=True)
+
+
 def _download_year_with_retries(
     pool: CookiePool,
     limiter: RateLimiter,
@@ -329,22 +357,30 @@ def _download_year_with_retries(
     records: list[dict],
     workers: int,
     label: str,
-    max_retry_rounds: int = 0,
+    max_retry_rounds: int = 3,
 ) -> tuple[int, int]:
-    """Download all tasks, retry failures, update records. Returns (ok, fail).
-
-    max_retry_rounds:
-      - 0 => retry until everything succeeds (recommended)
-      - N => stop after N retry rounds
-    """
+    """Download all tasks, retry transient failures, update records. Returns (ok, fail)."""
     ok, failed = _run_downloads(pool, limiter, tasks, workers, label)
+    permanent = [t for t in failed if _permanent_fail(t.get("_fail_msg", ""))]
+    retryable = [t for t in failed if not _permanent_fail(t.get("_fail_msg", ""))]
+
     round_no = 0
-    while failed and (max_retry_rounds <= 0 or round_no < max_retry_rounds):
+    prev = len(retryable) + 1
+    while retryable and round_no < max_retry_rounds:
         round_no += 1
-        suffix = f"{round_no}/{max_retry_rounds}" if max_retry_rounds > 0 else f"{round_no}"
-        print(f"  {label}: retrying {len(failed)} failed (round {suffix})...")
-        ok2, failed = _run_downloads(pool, limiter, failed, workers, f"{label} retry")
+        print(f"  {label}: retrying {len(retryable)} failed (round {round_no}/{max_retry_rounds})...", flush=True)
+        ok2, failed = _run_downloads(pool, limiter, retryable, workers, f"{label} retry")
         ok += ok2
+        permanent.extend(t for t in failed if _permanent_fail(t.get("_fail_msg", "")))
+        retryable = [t for t in failed if not _permanent_fail(t.get("_fail_msg", ""))]
+        if len(retryable) >= prev:
+            print(f"  {label}: no progress this round — stopping retries.", flush=True)
+            break
+        prev = len(retryable)
+
+    failed = permanent + retryable
+    if failed:
+        _print_failures(label, failed)
 
     # Sync record file/error fields with what actually landed on disk.
     out = cs.OUT_ROOT
