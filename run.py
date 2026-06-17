@@ -44,18 +44,28 @@ def _reload_session() -> None:
     cs.HEADERS = _s.HEADERS
 
 
-def refresh_until_valid(juris: str) -> bool:
-    """Refresh the session until check_session passes."""
-    print("\nSession blocked — need a fresh cookie.\n", flush=True)
-    cookie = ""
+def _harvest_one_window(juris: str) -> str:
+    """Open ONE Chrome window and keep it open until the captcha is solved.
+
+    macOS: incognito via AppleScript when Chrome allows JS over Apple Events;
+    otherwise (and on Linux/Windows) a SeleniumBase window. Never opens two.
+    """
     if platform_util.has_osascript() and platform_util.chrome_macos_installed():
-        cookie = auto_refresh.harvest_cookie_macos(keep_open=True, quick=True)
-    if not cookie:
-        cookie = auto_refresh.poll_incognito_windows()
-    if not cookie:
-        print("Opening browser via SeleniumBase (works when AppleScript cannot control Chrome)...\n", flush=True)
-        cookie = auto_refresh.harvest_cookie_browser()
+        cookie = auto_refresh.harvest_cookie_macos(keep_open=True)
+        if cookie and "datadome=" in cookie:
+            return cookie
+        if not auto_refresh.LAST_MAC_NOJS:
+            # Window worked but timed out without solving; let the caller retry.
+            return ""
+    # Fallback / non-macOS: a single long-lived SeleniumBase window.
+    return auto_refresh.harvest_cookie_browser()
+
+
+def refresh_until_valid(juris: str) -> bool:
+    """Refresh the session until check_session passes (one window at a time)."""
+    print("\nSession blocked — need a fresh cookie.\n", flush=True)
     while True:
+        cookie = _harvest_one_window(juris)
         if cookie and "datadome=" in cookie:
             auto_refresh.update_session_cookie(cookie, getattr(auto_refresh, "LAST_UA", ""))
             _reload_session()
@@ -64,17 +74,13 @@ def refresh_until_valid(juris: str) -> bool:
                 print("Session OK.\n", flush=True)
                 return True
             print("Cookie saved but CanLII still blocked for this jurisdiction.", flush=True)
-            cookie = ""
         try:
             input(
-                "\nSolve the captcha in the Chrome window, then press Enter "
-                "(Ctrl+C to quit)... "
+                "\nCaptcha not solved yet. Press Enter to open a fresh window and "
+                "try again (Ctrl+C to quit)... "
             )
         except (KeyboardInterrupt, EOFError):
             return False
-        cookie = auto_refresh.poll_incognito_windows()
-        if not cookie:
-            cookie = auto_refresh.harvest_cookie_browser()
 
 
 def ensure_session_or_refresh(juris: str) -> bool:

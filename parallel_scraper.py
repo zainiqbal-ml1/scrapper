@@ -436,7 +436,6 @@ def _pooled_get_years(pool: CookiePool, limiter: RateLimiter, juris: str, db: st
 def _scrape_juris(pool, limiter, juris, db_arg, args, grand) -> None:
     out = cs.OUT_ROOT
     all_dbs = _pooled_discover_databases(pool, limiter, juris)
-    pool.enable_prefetch()
     targets = list(all_dbs.keys()) if db_arg == ["all"] else db_arg
     print(f"\n=== {juris} ({cs.JURISDICTIONS.get(juris, juris)}): {len(targets)} db(s) ===")
 
