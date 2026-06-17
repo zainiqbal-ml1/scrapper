@@ -151,7 +151,7 @@ def main() -> int:
 
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
           f"workers={workers} rate={rate:g} req/s | OS: {platform_util.system()} "
-          f"| harvest: {platform_util.harvest_backend()}\n")
+          f"| harvest: {platform_util.harvest_backend()} | swap on burn only)\n")
 
     return run_parallel(juris, db_list, years, workers, rate)
 

@@ -7,9 +7,9 @@ Same output as canlii_scraper.py:
 
 How it scales (and its limits):
   - Runs N worker threads, each holding its OWN datadome cookie.
-  - A background thread keeps workers+3 cookies queued; harvest never blocks
-    download threads (workers keep going while captcha is solved in background).
-  - 429s retry on the same cookie; cookies rotate at ~75 downloads proactively.
+  - A background thread keeps spare cookies queued; harvest never blocks workers.
+  - Cookies swap only when DataDome actually blocks (challenge/403), not on a timer.
+  - 429s back off on the same cookie; burned cookies swap instantly from the pool.
   - A shared RATE LIMITER caps total requests/sec so the single IP doesn't get
     429'd (parallel workers share one IP, so this is the real ceiling).
   - Failed PDFs are retried up to 3 rounds before moving to the next year.
@@ -80,16 +80,14 @@ class RateLimiter:
 class CookiePool:
     """Queue of ready cookies; background thread keeps the pool topped up.
 
-    Workers never wait on captcha if a cookie is queued. When the pool drains,
-    harvest is kicked immediately (not on a slow poll loop). Cookies are also
-    rotated proactively before DataDome burns them (~75 requests).
+    Workers grab a spare cookie instantly when theirs burns. Harvest always runs
+    in the background — download threads never wait on captcha.
     """
 
-    COOKIE_BUDGET = 75       # swap out before the ~85-request burn
     MIN_READY = 2
     MAX_RETRIES = 2
-    ACQUIRE_POLL = 0.05      # seconds between queue polls
-    ACQUIRE_MAX_WAIT = 1.5   # never block downloads long; maintainer fills pool
+    SPIN_INTERVAL = 0.05   # seconds between instant pool checks when burned
+    SPIN_TRIES = 8           # ~0.4s max spin waiting for a queued cookie
 
     def __init__(self, workers: int = 3):
         self._workers = max(1, workers)
@@ -140,19 +138,17 @@ class CookiePool:
             self.kick_fill()
             return None
 
-    def acquire(self) -> str:
-        """Take a ready cookie. Raises CookieNotReady instead of blocking on captcha."""
+    def take_when_burned(self) -> str:
+        """Grab next cookie after a burn — instant, no captcha wait."""
         cookie = self.try_acquire()
         if cookie:
             return cookie
-        deadline = time.monotonic() + self.ACQUIRE_MAX_WAIT
-        while time.monotonic() < deadline:
-            try:
-                cookie = self._ready.get(timeout=self.ACQUIRE_POLL)
-                self.kick_fill()
+        for _ in range(self.SPIN_TRIES):
+            time.sleep(self.SPIN_INTERVAL)
+            cookie = self.try_acquire()
+            if cookie:
                 return cookie
-            except queue.Empty:
-                continue
+        self.kick_fill()
         raise CookieNotReady()
 
     def _maintainer(self) -> None:
@@ -179,30 +175,12 @@ class CookiePool:
 _local = threading.local()
 
 
-def get_session(pool: CookiePool, force_new: bool = False, *, must_swap: bool = False) -> requests.Session:
-    """Return this thread's session, swapping cookies without blocking on harvest.
-
-    must_swap=True  -> cookie is burned (403/429); only swap if pool has one ready.
-    must_swap=False -> proactive rotation at COOKIE_BUDGET; keep current if pool empty.
-    """
+def swap_session(pool: CookiePool) -> requests.Session:
+    """Replace burned cookie with the next ready one from the pool (no wait)."""
     used = getattr(_local, "used", 0)
-    session = getattr(_local, "session", None)
-    if not force_new and used >= CookiePool.COOKIE_BUDGET:
-        force_new = True
-    if not force_new and session is not None:
-        return session
-
-    cookie = pool.try_acquire()
-    if not cookie:
-        try:
-            cookie = pool.acquire()
-        except CookieNotReady:
-            if session is not None and not must_swap:
-                return session
-            raise
-
-    if force_new and used:
-        print(f"    (cookie swap after {used} downloads)", flush=True)
+    cookie = pool.take_when_burned()
+    if used:
+        print(f"    (cookie burned after {used} downloads — swapped)", flush=True)
     _local.session = requests.Session(
         impersonate=cs.IMPERSONATE, headers=HEADERS, cookies=parse_cookie(cookie), timeout=60
     )
@@ -210,8 +188,15 @@ def get_session(pool: CookiePool, force_new: bool = False, *, must_swap: bool = 
     return _local.session
 
 
+def get_session(pool: CookiePool) -> requests.Session:
+    session = getattr(_local, "session", None)
+    if session is not None:
+        return session
+    return swap_session(pool)
+
+
 def worker_get(pool: CookiePool, limiter: RateLimiter, url: str, referer: str | None):
-    """One GET with rate limiting. Reuses the same cookie on brief 429s."""
+    """One GET with rate limiting. Same cookie on 429; swap only on DataDome burn."""
     s = get_session(pool)
     headers = {"referer": referer} if referer else None
     rate_waits = 0
@@ -224,10 +209,8 @@ def worker_get(pool: CookiePool, limiter: RateLimiter, url: str, referer: str | 
             continue
         if r.status_code == 429:
             rate_waits += 1
-            if rate_waits <= 3:
-                time.sleep(1.0 * rate_waits)
-                continue
-            raise NeedNewCookie()
+            time.sleep(min(15.0, 1.5 * rate_waits))
+            continue
         if cs._is_challenge(r):
             raise NeedNewCookie()
         return r
@@ -248,19 +231,17 @@ def download_task(pool: CookiePool, limiter: RateLimiter, task: dict) -> tuple[d
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(r.content)
             _local.used = getattr(_local, "used", 0) + 1
-            if _local.used >= CookiePool.COOKIE_BUDGET - 20:
-                pool.kick_fill()
             return task, True, f"{len(r.content)//1024} KB"
         except NeedNewCookie:
             try:
-                get_session(pool, force_new=True, must_swap=True)
+                swap_session(pool)
             except CookieNotReady:
                 pool.kick_fill()
-                time.sleep(0.25)
+                time.sleep(0.05)
                 continue
         except CookieNotReady:
             pool.kick_fill()
-            time.sleep(0.25)
+            time.sleep(0.05)
             continue
     return task, False, "blocked (gave up after refreshes)"
 
@@ -360,13 +341,13 @@ def manager_get(pool: CookiePool, limiter: RateLimiter, url: str, referer: str |
             return worker_get(pool, limiter, url, referer)
         except NeedNewCookie:
             try:
-                get_session(pool, force_new=True, must_swap=True)
+                swap_session(pool)
             except CookieNotReady:
                 pool.kick_fill()
-                time.sleep(0.25)
+                time.sleep(0.05)
         except CookieNotReady:
             pool.kick_fill()
-            time.sleep(0.25)
+            time.sleep(0.05)
     raise RuntimeError(f"Could not fetch {url}")
 
 
