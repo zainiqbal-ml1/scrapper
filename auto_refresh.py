@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
-"""Auto-refresh the CanLII session via a real incognito Chrome window.
+"""Auto-refresh the CanLII session via a real Chrome window.
 
-Flow (no DevTools / no Copy-as-cURL needed):
-  1. Opens a NEW incognito Chrome window at the CanLII Ontario page.
-  2. You solve the DataDome slider in that window.
-  3. This polls the tab; once it passes (real page loads), it reads the
-     validated cookies via `document.cookie`, writes them into session.py,
-     clears the stale cookie cache, and exits 0.
-  4. If you don't solve it within the timeout, exits 1.
+macOS: opens incognito Chrome via AppleScript (or SeleniumBase fallback).
+Linux/Windows: opens Chrome via SeleniumBase (no osascript).
 
-Requirements (one-time):
-  - Chrome menu: View > Developer > "Allow JavaScript from Apple Events" (checked)
-  - Approve the macOS automation prompt for controlling Chrome the first time.
+You solve any captcha in the window; cookies are read automatically.
 """
 from __future__ import annotations
 
@@ -23,17 +16,15 @@ import time
 from pathlib import Path
 
 import bootstrap
+import browser_harvest
+import platform_util
 
 SESSION_FILE = Path("session.py")
 COOKIE_STATE = Path(".cookie_state.json")
 AUTO_CAP_CACHE = Path(".auto_solve_capable")
-START_URL = "https://www.canlii.org/en/on/"
-POLL_INTERVAL = 3      # seconds between checks
-POLL_TRIES = 80        # 80 * 3s = up to 4 minutes to solve the slider
-
-# We consider the page "passed" only when the REAL Ontario page is showing
-# (it lists "Court of Appeal for Ontario"). This means ALL captchas - the
-# DataDome slider AND CanLII's native captcha - have been solved.
+START_URL = browser_harvest.START_URL
+POLL_INTERVAL = browser_harvest.POLL_INTERVAL
+POLL_TRIES = browser_harvest.POLL_TRIES
 PASS_JS = "document.body && document.body.innerText.indexOf('Court of Appeal for Ontario')>-1 ? '1':'0'"
 
 APPLESCRIPT = '''
@@ -69,6 +60,8 @@ return grabbed
 
 
 def run_applescript() -> str:
+    if not platform_util.has_osascript():
+        return ""
     proc = subprocess.run(
         ["osascript", "-"], input=APPLESCRIPT, text=True, capture_output=True
     )
@@ -78,6 +71,23 @@ def run_applescript() -> str:
     return proc.stdout.strip()
 
 
+def harvest_cookie_macos() -> str:
+    """macOS-only: incognito via AppleScript."""
+    print("[auto_refresh] macOS: opening incognito Chrome (AppleScript)...", flush=True)
+    cookie = run_applescript()
+    return cookie.strip() if "datadome=" in cookie else ""
+
+
+def harvest_cookie_browser(try_auto: bool = False) -> str:
+    """Linux/Windows (and macOS fallback): SeleniumBase headed Chrome."""
+    global LAST_UA
+    cookie, ua = browser_harvest.harvest_cookie_interactive(try_auto_solve=try_auto)
+    if "datadome=" in cookie:
+        LAST_UA = ua
+        return cookie
+    return ""
+
+
 # Set to the User-Agent that came with the most recently harvested cookie
 # (only the automated SeleniumBase path can report it). Kept in sync so
 # curl_cffi presents the same fingerprint the cookie was minted under.
@@ -85,14 +95,14 @@ LAST_UA = ""
 
 
 def auto_solve_capable() -> bool:
-    """True only if PyAutoGUI can actually screenshot AND move the mouse.
+    """True if PyAutoGUI can screenshot and move the mouse (slider auto-solve).
 
-    The DataDome slider auto-solver needs macOS Screen Recording (to find the
-    slider) and Accessibility (to drag it). If either is missing, the drag
-    silently no-ops, so we skip the slow auto attempt and go straight to the
-    manual window. Result is cached in .auto_solve_capable (delete it to
-    re-test after granting permissions).
+    On macOS this needs Screen Recording + Accessibility. On Linux/Windows
+    needs a graphical display (DISPLAY / Wayland). Result cached in
+    .auto_solve_capable (delete to re-test).
     """
+    if platform_util.is_linux() and not _has_display():
+        return False
     if AUTO_CAP_CACHE.exists():
         try:
             return bool(json.loads(AUTO_CAP_CACHE.read_text()))
@@ -119,16 +129,20 @@ def auto_solve_capable() -> bool:
     return ok
 
 
-def harvest_cookie() -> str:
-    """Return a validated `document.cookie` string, or '' on failure.
+def _has_display() -> bool:
+    import os
+    if platform_util.is_windows():
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
-    If this machine can drive the mouse (Screen Recording + Accessibility
-    granted), tries the AUTOMATED slider solver first. Otherwise - or if it
-    fails - opens an incognito window for you to solve the slider yourself.
-    """
+
+def harvest_cookie() -> str:
+    """Return a validated `document.cookie` string, or '' on failure."""
     global LAST_UA
     LAST_UA = ""
-    if auto_solve_capable():
+
+    can_auto = auto_solve_capable()
+    if can_auto:
         try:
             import sb_mint
 
@@ -136,15 +150,21 @@ def harvest_cookie() -> str:
             if "datadome=" in cookie:
                 LAST_UA = sb_mint.LAST_UA
                 return cookie.strip()
-            print("[auto_refresh] Auto-solve didn't pass; opening a window for you to solve.", file=sys.stderr)
+            print("[auto_refresh] Auto-solve didn't pass; opening browser for you.", file=sys.stderr)
         except Exception as e:
-            print(f"[auto_refresh] Auto-solve unavailable ({e}); opening a window.", file=sys.stderr)
-    else:
-        print("[auto_refresh] Auto-solve needs Screen Recording + Accessibility "
-              "(mouse control is blocked here) - opening a window for you to solve.", file=sys.stderr)
+            print(f"[auto_refresh] Auto-solve unavailable ({e}); opening browser.", file=sys.stderr)
 
-    cookie = run_applescript()
-    return cookie.strip() if "datadome=" in cookie else ""
+    # macOS: fast path via AppleScript (incognito, no SeleniumBase startup).
+    if platform_util.has_osascript():
+        cookie = harvest_cookie_macos()
+        if "datadome=" in cookie:
+            return cookie
+        print("[auto_refresh] AppleScript didn't pass; trying SeleniumBase browser.", file=sys.stderr)
+
+    # Linux / Windows / macOS fallback: headed Chrome via SeleniumBase.
+    if platform_util.is_linux():
+        print(f"[auto_refresh] Linux detected — using SeleniumBase ({platform_util.harvest_backend()}).", flush=True)
+    return harvest_cookie_browser(try_auto=can_auto)
 
 
 def update_session_cookie(cookie: str, ua: str = "") -> None:
@@ -159,7 +179,8 @@ def update_session_cookie(cookie: str, ua: str = "") -> None:
 
 
 def main() -> int:
-    print("Opening an incognito Chrome window... solve the slider there.")
+    print(f"Harvest backend: {platform_util.harvest_backend()}")
+    print("Opening a browser window... solve any captcha there.")
     print("(Waiting up to ~4 min; it auto-detects when you pass.)")
     cookie = harvest_cookie()
     if "datadome=" not in cookie:

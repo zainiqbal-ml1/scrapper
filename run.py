@@ -21,6 +21,9 @@ import sys
 
 import bootstrap
 bootstrap.ensure_session_file()
+bootstrap.warn_if_macos_venv_on_linux()
+
+import platform_util
 
 import canlii_scraper as cs
 import auto_refresh
@@ -147,8 +150,8 @@ def main() -> int:
             db_list.append(tok)
 
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
-          f"workers={workers} rate={rate:g} req/s "
-          f"(cookie pool tops up in background; proactive swap at ~75 req)\n")
+          f"workers={workers} rate={rate:g} req/s | OS: {platform_util.system()} "
+          f"| harvest: {platform_util.harvest_backend()}\n")
 
     return run_parallel(juris, db_list, years, workers, rate)
 
