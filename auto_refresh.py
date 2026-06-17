@@ -252,7 +252,9 @@ def harvest_cookie_macos(
                 )
             _run_as(AS_CLOSE_WINDOW % win_idx, quiet=True)
             LAST_MAC_NOJS = True
+            platform_util.set_apple_events_works(False)
             return ""
+        platform_util.set_apple_events_works(True)
 
         cookie = ""
         passed = "0"
@@ -345,10 +347,26 @@ def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+def can_background_harvest() -> bool:
+    """True when cookies can be minted without popping a headed browser at the user.
+
+    Linux: system Chrome attach. macOS: only when AppleScript JS works.
+    macOS without Apple Events must use one visible SeleniumBase window on demand.
+    """
+    if platform_util.is_linux():
+        return True
+    if platform_util.has_osascript() and platform_util.apple_events_works():
+        return True
+    return False
+
+
 def harvest_cookie_pool(*, quiet: bool = False, timeout_s: float = 180) -> str:
     """Harvest one validated cookie for the download pool."""
     global LAST_UA
     LAST_UA = ""
+    if quiet and not can_background_harvest():
+        # Never pop SeleniumBase windows silently in the background on this Mac.
+        return ""
     if platform_util.has_osascript():
         cookie = harvest_cookie_macos(keep_open=True, quiet=quiet, timeout_s=timeout_s)
         if "datadome=" in cookie:
@@ -366,6 +384,8 @@ def harvest_cookie_pool(*, quiet: bool = False, timeout_s: float = 180) -> str:
         except Exception as e:
             if not quiet:
                 print(f"[auto_refresh] Linux fast harvest failed ({e}); using SeleniumBase.", file=sys.stderr)
+    if quiet and not can_background_harvest():
+        return ""
     cookie, ua = browser_harvest.harvest_cookie_interactive(
         try_auto_solve=False, quiet=quiet, timeout_s=timeout_s,
     )

@@ -48,9 +48,9 @@ xvfb-run python run.py
 
 CanLII's anti-bot (DataDome) throttles by **IP address**, so the scraper uses a **single download worker** and controls throughput with **requests/second**.
 
-- A **cookie pool** keeps **4 cookies** ready in the background (harvest windows refill the queue).
-- On **any error** (429, 403, network, bad response) the scraper **discards that cookie and grabs the next one** from the pool — it never retries with a burned cookie.
-- Progress shows `pool=3/4` so you can see when the queue is running low.
+- A **cookie pool** keeps cookies ready (4 on Linux with fast harvest; **on-demand only on Mac** without Apple Events).
+- On **any error** (429, 403, network) the scraper **discards that cookie and grabs the next one** — never retries with a burned cookie.
+- **Mac without Apple Events**: only **one browser window** opens when a cookie is actually burned — no background pop-up storm during downloads.
 - Pick a `--rate` your IP tolerates. Start around `2`-`4`; lower it if you see frequent 429s.
 
 ```bash

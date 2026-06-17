@@ -48,3 +48,24 @@ def default_workers() -> int:
 def default_rate() -> float:
     """Sensible requests/sec cap for this OS."""
     return 4.0 if is_linux() else 2.0
+
+
+APPLE_EVENTS_CACHE = Path(".mac_apple_events_ok")
+
+
+def set_apple_events_works(ok: bool) -> None:
+    """Remember whether Chrome allows JS from Apple Events on this Mac."""
+    if is_macos():
+        try:
+            APPLE_EVENTS_CACHE.write_text("1" if ok else "0")
+        except Exception:
+            pass
+
+
+def apple_events_works() -> bool:
+    """Cached result of Chrome > Developer > Allow JavaScript from Apple Events."""
+    if not is_macos():
+        return False
+    if APPLE_EVENTS_CACHE.exists():
+        return APPLE_EVENTS_CACHE.read_text().strip() == "1"
+    return False

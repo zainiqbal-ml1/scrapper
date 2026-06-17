@@ -102,19 +102,17 @@ class RateLimiter:
 
 
 class CookiePool:
-    """Queue of ready cookies; background harvesters keep 3–4 ahead.
+    """Queue of ready cookies; background harvesters refill when possible.
 
-    Workers take a cookie from the queue. On any request error the cookie is
-    discarded and the next ready cookie is used — never retry with a burned one.
+    On macOS without AppleScript JS: no silent background windows — one visible
+    browser opens only when a fresh cookie is actually needed.
     """
-
-    TARGET_READY = 4
-    MAX_PARALLEL_HARVESTS = 2 if platform_util.is_macos() else 1
-    ACQUIRE_POLL = 0.05
-    ACQUIRE_MAX_WAIT = 180
 
     def __init__(self, workers: int = 1):
         self._workers = max(1, workers)
+        self._background = auto_refresh.can_background_harvest()
+        self.TARGET_READY = 4 if self._background else 1
+        self.MAX_PARALLEL_HARVESTS = 2 if self._background else 1
         self._ready: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
         self._harvests_lock = threading.Lock()
@@ -131,25 +129,42 @@ class CookiePool:
         return self._ready.qsize()
 
     def enable_prefetch(self) -> None:
-        """Start keeping the pool filled after the session is proven good."""
         if self._prefetch_enabled:
             return
         self._prefetch_enabled = True
-        print(f"Cookie pool: keeping {self.TARGET_READY} ready "
-              f"(up to {self.MAX_PARALLEL_HARVESTS} parallel harvests).\n", flush=True)
-        self.kick_fill()
+        if self._background:
+            print(f"Cookie pool: keeping {self.TARGET_READY} ready in background "
+                  f"(up to {self.MAX_PARALLEL_HARVESTS} parallel harvests).\n", flush=True)
+            self.kick_fill()
+        else:
+            print("Cookie pool: using your session cookie; one browser window opens "
+                  "only when a cookie is burned (no background pop-ups).\n", flush=True)
 
-    def _do_harvest(self) -> str:
+    ACQUIRE_POLL = 0.05
+    ACQUIRE_MAX_WAIT = 180
+
+    def _do_harvest(self, *, visible: bool = False) -> str:
         with self._harvests_lock:
             self._harvest_serial += 1
             n = self._harvest_serial
-        print(f"\n>>> Harvesting cookie #{n} for pool "
-              f"(ready={self._ready.qsize()}/{self.TARGET_READY})...\n", flush=True)
-        cookie = auto_refresh.harvest_cookie_pool(quiet=True, timeout_s=180)
+        quiet = not visible and self._background
+        if visible or not self._background:
+            print(
+                f"\n>>> Cookie burned — opening ONE browser window (#{n}).\n"
+                "    Solve the captcha if shown; it closes itself once you pass.\n",
+                flush=True,
+            )
+        elif quiet:
+            print(f"\n>>> Background harvest #{n} (pool {self._ready.qsize()}/{self.TARGET_READY})...\n",
+                  flush=True)
+        cookie = auto_refresh.harvest_cookie_pool(
+            quiet=quiet, timeout_s=600 if visible else 180,
+        )
         if cookie and "datadome=" in cookie:
-            print(f">>> Cookie #{n} ready — pool now ~{self._ready.qsize() + 1}.\n", flush=True)
-        else:
-            print(f">>> Cookie #{n} harvest failed (solve captcha if a window opened).\n", flush=True)
+            print(f">>> Cookie #{n} ready — pool ~{self._ready.qsize() + 1}/{self.TARGET_READY}.\n",
+                  flush=True)
+        elif visible:
+            print(f">>> Cookie #{n} not captured — solve captcha in the window.\n", flush=True)
         return cookie
 
     def _harvest_worker(self) -> None:
@@ -169,7 +184,7 @@ class CookiePool:
 
     def kick_fill(self) -> None:
         """Launch background harvests until the pool reaches TARGET_READY."""
-        if self._stop.is_set() or not self._prefetch_enabled:
+        if self._stop.is_set() or not self._prefetch_enabled or not self._background:
             return
         with self._harvests_lock:
             needed = self.TARGET_READY - self._ready.qsize()
@@ -183,7 +198,7 @@ class CookiePool:
 
     def _maintainer_loop(self) -> None:
         while not self._stop.is_set():
-            if self._prefetch_enabled and self._ready.qsize() < self.TARGET_READY:
+            if self._background and self._prefetch_enabled and self._ready.qsize() < self.TARGET_READY:
                 self.kick_fill()
             time.sleep(0.4)
 
@@ -203,7 +218,6 @@ class CookiePool:
                 continue
         with self._harvests_lock:
             if self._active_harvests > 0:
-                # Another harvest is running; wait for it to fill the queue.
                 while time.monotonic() < deadline and not self._stop.is_set():
                     try:
                         return self._ready.get(timeout=self.ACQUIRE_POLL)
@@ -212,7 +226,7 @@ class CookiePool:
                 raise NeedNewCookie("timed out waiting for pool harvest")
             self._active_harvests += 1
         try:
-            cookie = self._do_harvest()
+            cookie = self._do_harvest(visible=not self._background)
         finally:
             with self._harvests_lock:
                 self._active_harvests -= 1
@@ -515,8 +529,9 @@ def main() -> int:
     limiter = RateLimiter(args.rate)
     pool.enable_prefetch()
 
-    print(f"Cookie pool: keeping {pool.TARGET_READY} cookies ready; "
-          f"swap on any error (429/403/network).\n")
+    mode = ("background refill to 4" if pool._background
+            else "on-demand only (one window when cookie burns)")
+    print(f"Cookie pool: {mode}; swap on error.\n")
 
     jurisdictions = list(cs.JURISDICTIONS.keys()) if args.juris == "all" else [args.juris]
     grand = {"total": 0, "downloaded": 0, "failed": 0}

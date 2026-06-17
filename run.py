@@ -45,19 +45,15 @@ def _reload_session() -> None:
 
 
 def _harvest_one_window(juris: str) -> str:
-    """Open ONE Chrome window and keep it open until the captcha is solved.
-
-    macOS: incognito via AppleScript when Chrome allows JS over Apple Events;
-    otherwise (and on Linux/Windows) a SeleniumBase window. Never opens two.
-    """
+    """Open ONE Chrome window and keep it open until the captcha is solved."""
     if platform_util.has_osascript() and platform_util.chrome_macos_installed():
         cookie = auto_refresh.harvest_cookie_macos(keep_open=True)
         if cookie and "datadome=" in cookie:
             return cookie
-        if not auto_refresh.LAST_MAC_NOJS:
-            # Window worked but timed out without solving; let the caller retry.
+        if auto_refresh.LAST_MAC_NOJS:
+            platform_util.set_apple_events_works(False)
+        elif not auto_refresh.LAST_MAC_NOJS:
             return ""
-    # Fallback / non-macOS: a single long-lived SeleniumBase window.
     return auto_refresh.harvest_cookie_browser()
 
 

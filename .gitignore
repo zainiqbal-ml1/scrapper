@@ -9,6 +9,7 @@ session.py
 curl.txt
 .cookie_state.json
 .auto_solve_capable
+.mac_apple_events_ok
 
 # python cache
 __pycache__/
