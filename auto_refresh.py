@@ -28,7 +28,7 @@ POLL_JS = browser_harvest.POLL_JS
 LAST_MAC_NOJS = False
 
 _harvest_lock = threading.Lock()
-IP_COOLDOWN_SEC = 90
+IP_COOLDOWN_SEC = 20
 _ip_cooldown_until = 0.0
 _ip_block_announced = False
 
