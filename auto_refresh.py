@@ -38,33 +38,25 @@ def ip_blocked_cooldown_active() -> bool:
 
 
 def mark_ip_blocked(*, quiet: bool = False) -> None:
-    """DataDome IP hard block — stop opening harvest windows; wait for cooldown."""
+    """DataDome IP hard block — log once; harvest retries immediately (no sleep)."""
     global _ip_cooldown_until, _ip_block_announced
     _ip_cooldown_until = max(_ip_cooldown_until, time.monotonic() + IP_COOLDOWN_SEC)
     if not quiet and not _ip_block_announced:
         _ip_block_announced = True
         print(
-            f"\n>>> Access temporarily blocked (IP cooldown ~{IP_COOLDOWN_SEC}s).\n"
-            "    New cookies/windows won't help yet — pausing harvest.\n"
-            "    (Ctrl+C and restart after 1–2 min also works.)\n",
+            "\n>>> Access temporarily blocked — harvesting a fresh cookie...\n",
             flush=True,
         )
 
 
 def wait_ip_cooldown(*, quiet: bool = False) -> None:
-    """Block until IP cooldown expires."""
+    """No-op (cooldown waits removed)."""
     global _ip_block_announced
-    while ip_blocked_cooldown_active():
-        left = int(_ip_cooldown_until - time.monotonic())
-        if not quiet and left > 0 and left % 30 == 0:
-            print(f"    ... IP cooldown ~{left}s left", flush=True)
-        time.sleep(1)
     _ip_block_announced = False
 
 
 def _handle_ip_block(*, quiet: bool = False) -> None:
     mark_ip_blocked(quiet=quiet)
-    wait_ip_cooldown(quiet=quiet)
 
 
 def _run_as(script: str, *, quiet: bool = False) -> str:
@@ -189,8 +181,6 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
         )
 
         while True:
-            if ip_blocked_cooldown_active():
-                wait_ip_cooldown(quiet=quiet)
             raw = _run_as(_as_poll(win_idx), quiet=True)
             cookie, poll_passed, challenged, ip_blocked = browser_harvest.parse_poll(raw)
             if ip_blocked:
@@ -333,14 +323,6 @@ def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def can_background_harvest() -> bool:
-    if platform_util.is_linux():
-        return True
-    if platform_util.has_osascript() and platform_util.apple_events_works():
-        return True
-    return False
-
-
 def _try_auto_slider_first(*, quiet: bool = False) -> str:
     """SeleniumBase + PyAutoGUI before AppleScript (AppleScript cannot drag the slider)."""
     if platform_util.is_macos():
@@ -350,42 +332,10 @@ def _try_auto_slider_first(*, quiet: bool = False) -> str:
     return ""
 
 
-def harvest_cookie_pool(*, quiet: bool = False) -> str:
-    """One cookie for the download pool."""
-    global LAST_UA
-    LAST_UA = ""
-    cookie = _try_auto_slider_first(quiet=quiet)
-    if "datadome=" in cookie:
-        return cookie
-    if platform_util.has_osascript() and platform_util.apple_events_works():
-        cookie = harvest_cookie_macos(quiet=quiet)
-        if "datadome=" in cookie:
-            return cookie
-    if platform_util.is_linux():
-        try:
-            from linux_chrome_harvest import harvest_linux_fast
-
-            cookie, ua = harvest_linux_fast(quiet=quiet)
-            if "datadome=" in cookie:
-                LAST_UA = ua
-                return cookie
-        except Exception:
-            pass
-    if quiet and not platform_util.is_linux():
-        return ""
-    return harvest_cookie_browser(
-        try_auto=platform_util.is_macos() or auto_solve_capable(force_recheck=True),
-        quiet=quiet,
-    )
-
-
 def harvest_cookie() -> str:
     """Harvest a validated cookie — auto slider first when permitted."""
     global LAST_UA
     LAST_UA = ""
-
-    if ip_blocked_cooldown_active():
-        wait_ip_cooldown()
 
     cookie = _try_auto_slider_first(quiet=False)
     if "datadome=" in cookie:
