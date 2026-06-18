@@ -133,8 +133,11 @@ class CookiePool:
             if not quiet:
                 print("\n>>> Harvesting a fresh cookie...\n", flush=True)
             for _ in range(self.MAX_RETRIES):
-                if auto_refresh.can_background_harvest():
-                    cookie = auto_refresh.harvest_cookie_pool(quiet=quiet)
+                # User-facing harvest: full path with messages; pool path for silent prefill.
+                if not quiet:
+                    cookie = auto_refresh.harvest_cookie()
+                elif auto_refresh.can_background_harvest():
+                    cookie = auto_refresh.harvest_cookie_pool(quiet=True)
                 else:
                     cookie = auto_refresh.harvest_cookie()
                 if cookie and "datadome=" in cookie:

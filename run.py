@@ -170,6 +170,8 @@ def main() -> int:
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
           f"rate={rate:g} req/s | OS: {platform_util.system()} "
           f"| harvest: {platform_util.harvest_backend()}\n")
+    auto_refresh.print_harvest_capabilities(force_recheck=True)
+    print(flush=True)
 
     if juris != "all" and not ensure_session_or_refresh(juris):
         return 130

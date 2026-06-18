@@ -245,11 +245,14 @@ LAST_UA = ""
 
 
 def auto_solve_capable(*, force_recheck: bool = False) -> bool:
+    """True when PyAutoGUI can screenshot + move the mouse (auto slider)."""
     if platform_util.is_linux() and not _has_display():
         return False
+    # Only trust a cached True; re-test if missing or False (permissions may have been fixed).
     if not force_recheck and AUTO_CAP_CACHE.exists():
         try:
-            return bool(json.loads(AUTO_CAP_CACHE.read_text()))
+            if json.loads(AUTO_CAP_CACHE.read_text()) is True:
+                return True
         except Exception:
             pass
     ok = False
@@ -266,19 +269,43 @@ def auto_solve_capable(*, force_recheck: bool = False) -> bool:
         pyautogui.moveTo(start[0], start[1], duration=0.05)
         ok = abs(end[0] - (start[0] + 6)) < 4 and abs(end[1] - (start[1] + 6)) < 4
         if not ok:
-            err = "mouse did not move (enable Accessibility for Terminal/Cursor)"
+            err = "mouse did not move — enable Accessibility for the app running Python"
     except Exception as e:
         err = str(e)
-        if platform_util.is_macos() and "screenshot" in err.lower():
-            err = "screenshot failed (enable Screen Recording for Terminal/Cursor)"
+        low = err.lower()
+        if platform_util.is_macos() and ("screenshot" in low or "screen" in low):
+            err = "screenshot failed — enable Screen Recording for the app running Python"
         ok = False
     try:
-        AUTO_CAP_CACHE.write_text(json.dumps(ok))
+        if ok:
+            AUTO_CAP_CACHE.write_text(json.dumps(True))
+        elif AUTO_CAP_CACHE.exists():
+            AUTO_CAP_CACHE.unlink()
     except Exception:
         pass
-    if not ok and err and platform_util.is_macos():
+    if not ok and err and platform_util.is_macos() and not force_recheck:
         print(f"[auto_refresh] Auto slider unavailable: {err}", file=sys.stderr, flush=True)
     return ok
+
+
+def print_harvest_capabilities(*, force_recheck: bool = True) -> bool:
+    """Print whether auto slider is available; return capability flag."""
+    import os
+
+    term = os.environ.get("TERM_PROGRAM") or os.environ.get("TERM_PROGRAM_VERSION") or "terminal"
+    capable = auto_solve_capable(force_recheck=force_recheck)
+    if capable:
+        print(f"Auto slider: ON (PyAutoGUI OK via {term})", flush=True)
+    else:
+        print(f"Auto slider: OFF — manual captcha in Chrome ({term})", flush=True)
+        if platform_util.is_macos():
+            print(
+                "  macOS: System Settings → Privacy & Security → Screen Recording + Accessibility\n"
+                "  Enable the app you run python from (Terminal.app OR Cursor — not both unless both used).\n"
+                "  Quit and reopen that app after granting. Optional: rm -f .auto_solve_capable",
+                flush=True,
+            )
+    return capable
 
 
 def _try_sb_mint(*, quiet: bool = False) -> str:
@@ -296,10 +323,6 @@ def _try_sb_mint(*, quiet: bool = False) -> str:
     except Exception as e:
         if not quiet:
             print(f"[auto_refresh] Auto-solve failed ({e}).", file=sys.stderr, flush=True)
-        try:
-            AUTO_CAP_CACHE.write_text(json.dumps(False))
-        except Exception:
-            pass
     return ""
 
 
@@ -318,14 +341,22 @@ def can_background_harvest() -> bool:
     return False
 
 
+def _try_auto_slider_first(*, quiet: bool = False) -> str:
+    """SeleniumBase + PyAutoGUI before AppleScript (AppleScript cannot drag the slider)."""
+    if platform_util.is_macos():
+        return _try_sb_mint(quiet=quiet)
+    if auto_solve_capable(force_recheck=True):
+        return _try_sb_mint(quiet=quiet)
+    return ""
+
+
 def harvest_cookie_pool(*, quiet: bool = False) -> str:
     """One cookie for the download pool."""
     global LAST_UA
     LAST_UA = ""
-    if auto_solve_capable():
-        cookie = _try_sb_mint(quiet=quiet)
-        if "datadome=" in cookie:
-            return cookie
+    cookie = _try_auto_slider_first(quiet=quiet)
+    if "datadome=" in cookie:
+        return cookie
     if platform_util.has_osascript() and platform_util.apple_events_works():
         cookie = harvest_cookie_macos(quiet=quiet)
         if "datadome=" in cookie:
@@ -342,7 +373,10 @@ def harvest_cookie_pool(*, quiet: bool = False) -> str:
             pass
     if quiet and not platform_util.is_linux():
         return ""
-    return harvest_cookie_browser(try_auto=auto_solve_capable(), quiet=quiet)
+    return harvest_cookie_browser(
+        try_auto=platform_util.is_macos() or auto_solve_capable(force_recheck=True),
+        quiet=quiet,
+    )
 
 
 def harvest_cookie() -> str:
@@ -353,11 +387,13 @@ def harvest_cookie() -> str:
     if ip_blocked_cooldown_active():
         wait_ip_cooldown()
 
-    if auto_solve_capable():
-        cookie = _try_sb_mint(quiet=False)
-        if "datadome=" in cookie:
-            return cookie
+    cookie = _try_auto_slider_first(quiet=False)
+    if "datadome=" in cookie:
+        return cookie
+    if platform_util.is_macos():
         print("Auto slider did not finish — opening manual harvest.\n", flush=True)
+    elif not auto_solve_capable(force_recheck=True):
+        print("Auto slider skipped (permissions not detected for this terminal).\n", flush=True)
 
     if platform_util.has_osascript() and platform_util.chrome_macos_installed():
         ae_cache = platform_util.APPLE_EVENTS_CACHE
@@ -380,7 +416,9 @@ def harvest_cookie() -> str:
         except Exception:
             pass
 
-    cookie = harvest_cookie_browser(try_auto=auto_solve_capable())
+    cookie = harvest_cookie_browser(
+        try_auto=platform_util.is_macos() or auto_solve_capable(force_recheck=True),
+    )
     if "datadome=" in cookie:
         return cookie
 

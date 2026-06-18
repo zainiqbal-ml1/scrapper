@@ -32,6 +32,7 @@ def _mint() -> tuple[str, str]:
     with SB(uc=True, headed=True, locale="en") as sb:
         sb.activate_cdp_mode(START_URL)
         sb.sleep(1.0)
+        print("\n>>> DataDome slider — auto-solving (SeleniumBase + mouse)...\n", flush=True)
 
         def read_state() -> tuple[str, str, str, bool, str]:
             try:
@@ -65,7 +66,7 @@ def _mint() -> tuple[str, str]:
                         print(f"[sb_mint] auto-solve attempt {auto_attempts}: {e}", file=sys.stderr)
                 if not prompt_shown:
                     prompt_shown = True
-                    print("\n>>> DataDome slider — auto-solving...\n", flush=True)
+                    print(">>> Slider detected — dragging...\n", flush=True)
             elif browser_harvest.page_challenged_html(src):
                 if not prompt_shown:
                     prompt_shown = True
