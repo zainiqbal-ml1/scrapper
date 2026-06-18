@@ -13,8 +13,10 @@ from browser_harvest import (
     StablePassTracker,
     cookie_ready,
     page_challenged_html,
+    page_ip_blocked_html,
     page_passed_html,
     parse_poll,
+    _handle_ip_block_from_harvest,
 )
 
 
@@ -41,7 +43,9 @@ def _read_state(driver) -> tuple[str, str, bool, bool]:
     page_ok = page_passed_html(src)
     try:
         raw = driver.execute_script(f"return {POLL_JS}") or ""
-        cookie, poll_passed, poll_challenged = parse_poll(str(raw))
+        cookie, poll_passed, poll_challenged, ip_blocked = parse_poll(str(raw))
+        if ip_blocked:
+            challenged = True
         if poll_challenged:
             challenged = True
         if poll_passed:
@@ -110,6 +114,14 @@ def harvest_linux_fast(*, quiet: bool = True) -> tuple[str, str]:
 
         while True:
             cookie, ua, challenged, page_ok = _read_state(driver)
+            try:
+                src = driver.page_source or ""
+            except Exception:
+                src = ""
+            if page_ip_blocked_html(src):
+                _handle_ip_block_from_harvest(quiet=quiet)
+                break
+
             page_ok = page_ok or cookie_ready(cookie, challenged=False)
 
             if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):

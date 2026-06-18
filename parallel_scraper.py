@@ -118,7 +118,17 @@ class CookiePool:
         print(f"Cookie pool: {n}/{count} ready.\n", flush=True)
         return n
 
+    def drain(self) -> None:
+        """Drop pooled cookies (all burned during an IP block)."""
+        while not self._ready.empty():
+            try:
+                self._ready.get_nowait()
+            except queue.Empty:
+                break
+
     def _harvest(self, *, quiet: bool = True) -> str:
+        if auto_refresh.ip_blocked_cooldown_active():
+            auto_refresh.wait_ip_cooldown(quiet=quiet)
         with self._harvest_lock:
             if not quiet:
                 print("\n>>> Harvesting a fresh cookie...\n", flush=True)
@@ -153,6 +163,8 @@ class CookiePool:
             self._need_fill.clear()
             if self._stop.is_set():
                 break
+            if auto_refresh.ip_blocked_cooldown_active():
+                continue
             while self._ready.qsize() < self.TARGET_READY and not self._stop.is_set():
                 self._fill_one()
 
@@ -245,6 +257,10 @@ def worker_get(pool: CookiePool, limiter: RateLimiter, url: str, referer: str | 
                 raise NeedNewCookie()
             continue
         if r.status_code == 429 or cs._is_challenge(r):
+            if cs.is_ip_blocked_response(r):
+                auto_refresh.mark_ip_blocked()
+                pool.drain()
+                auto_refresh.wait_ip_cooldown()
             raise NeedNewCookie()
         return r
 

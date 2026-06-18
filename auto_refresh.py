@@ -28,6 +28,43 @@ POLL_JS = browser_harvest.POLL_JS
 LAST_MAC_NOJS = False
 
 _harvest_lock = threading.Lock()
+IP_COOLDOWN_SEC = 90
+_ip_cooldown_until = 0.0
+_ip_block_announced = False
+
+
+def ip_blocked_cooldown_active() -> bool:
+    return time.monotonic() < _ip_cooldown_until
+
+
+def mark_ip_blocked(*, quiet: bool = False) -> None:
+    """DataDome IP hard block — stop opening harvest windows; wait for cooldown."""
+    global _ip_cooldown_until, _ip_block_announced
+    _ip_cooldown_until = max(_ip_cooldown_until, time.monotonic() + IP_COOLDOWN_SEC)
+    if not quiet and not _ip_block_announced:
+        _ip_block_announced = True
+        print(
+            f"\n>>> Access temporarily blocked (IP cooldown ~{IP_COOLDOWN_SEC}s).\n"
+            "    New cookies/windows won't help yet — pausing harvest.\n"
+            "    (Ctrl+C and restart after 1–2 min also works.)\n",
+            flush=True,
+        )
+
+
+def wait_ip_cooldown(*, quiet: bool = False) -> None:
+    """Block until IP cooldown expires."""
+    global _ip_block_announced
+    while ip_blocked_cooldown_active():
+        left = int(_ip_cooldown_until - time.monotonic())
+        if not quiet and left > 0 and left % 30 == 0:
+            print(f"    ... IP cooldown ~{left}s left", flush=True)
+        time.sleep(1)
+    _ip_block_announced = False
+
+
+def _handle_ip_block(*, quiet: bool = False) -> None:
+    mark_ip_blocked(quiet=quiet)
+    wait_ip_cooldown(quiet=quiet)
 
 
 def _run_as(script: str, *, quiet: bool = False) -> str:
@@ -152,8 +189,14 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
         )
 
         while True:
+            if ip_blocked_cooldown_active():
+                wait_ip_cooldown(quiet=quiet)
             raw = _run_as(_as_poll(win_idx), quiet=True)
-            cookie, poll_passed, challenged = browser_harvest.parse_poll(raw)
+            cookie, poll_passed, challenged, ip_blocked = browser_harvest.parse_poll(raw)
+            if ip_blocked:
+                _run_as(AS_CLOSE % win_idx, quiet=True)
+                _handle_ip_block(quiet=quiet)
+                break
             page_ok = poll_passed or browser_harvest.cookie_ready(cookie, challenged=False)
 
             if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
@@ -201,15 +244,16 @@ def harvest_cookie_browser(*, try_auto: bool = False, quiet: bool = False) -> st
 LAST_UA = ""
 
 
-def auto_solve_capable() -> bool:
+def auto_solve_capable(*, force_recheck: bool = False) -> bool:
     if platform_util.is_linux() and not _has_display():
         return False
-    if AUTO_CAP_CACHE.exists():
+    if not force_recheck and AUTO_CAP_CACHE.exists():
         try:
             return bool(json.loads(AUTO_CAP_CACHE.read_text()))
         except Exception:
             pass
     ok = False
+    err = ""
     try:
         import pyautogui
 
@@ -221,13 +265,42 @@ def auto_solve_capable() -> bool:
         end = pyautogui.position()
         pyautogui.moveTo(start[0], start[1], duration=0.05)
         ok = abs(end[0] - (start[0] + 6)) < 4 and abs(end[1] - (start[1] + 6)) < 4
-    except Exception:
+        if not ok:
+            err = "mouse did not move (enable Accessibility for Terminal/Cursor)"
+    except Exception as e:
+        err = str(e)
+        if platform_util.is_macos() and "screenshot" in err.lower():
+            err = "screenshot failed (enable Screen Recording for Terminal/Cursor)"
         ok = False
     try:
         AUTO_CAP_CACHE.write_text(json.dumps(ok))
     except Exception:
         pass
+    if not ok and err and platform_util.is_macos():
+        print(f"[auto_refresh] Auto slider unavailable: {err}", file=sys.stderr, flush=True)
     return ok
+
+
+def _try_sb_mint(*, quiet: bool = False) -> str:
+    """Auto-solve DataDome slider via SeleniumBase + PyAutoGUI."""
+    global LAST_UA
+    try:
+        import sb_mint
+
+        if not quiet:
+            print("\n>>> Auto-solving DataDome slider...\n", flush=True)
+        cookie = sb_mint.harvest_cookie()
+        if "datadome=" in cookie:
+            LAST_UA = sb_mint.LAST_UA
+            return cookie.strip()
+    except Exception as e:
+        if not quiet:
+            print(f"[auto_refresh] Auto-solve failed ({e}).", file=sys.stderr, flush=True)
+        try:
+            AUTO_CAP_CACHE.write_text(json.dumps(False))
+        except Exception:
+            pass
+    return ""
 
 
 def _has_display() -> bool:
@@ -246,11 +319,14 @@ def can_background_harvest() -> bool:
 
 
 def harvest_cookie_pool(*, quiet: bool = False) -> str:
-    """One cookie for the download pool (silent when AppleScript/Linux fast path works)."""
+    """One cookie for the download pool."""
     global LAST_UA
     LAST_UA = ""
+    if auto_solve_capable():
+        cookie = _try_sb_mint(quiet=quiet)
+        if "datadome=" in cookie:
+            return cookie
     if platform_util.has_osascript() and platform_util.apple_events_works():
-        # No short timeout — if captcha appears, wait until the user solves it.
         cookie = harvest_cookie_macos(quiet=quiet)
         if "datadome=" in cookie:
             return cookie
@@ -266,13 +342,22 @@ def harvest_cookie_pool(*, quiet: bool = False) -> str:
             pass
     if quiet and not platform_util.is_linux():
         return ""
-    return harvest_cookie_browser(try_auto=False, quiet=quiet)
+    return harvest_cookie_browser(try_auto=auto_solve_capable(), quiet=quiet)
 
 
 def harvest_cookie() -> str:
-    """Harvest a validated cookie — one window at a time."""
+    """Harvest a validated cookie — auto slider first when permitted."""
     global LAST_UA
     LAST_UA = ""
+
+    if ip_blocked_cooldown_active():
+        wait_ip_cooldown()
+
+    if auto_solve_capable():
+        cookie = _try_sb_mint(quiet=False)
+        if "datadome=" in cookie:
+            return cookie
+        print("Auto slider did not finish — opening manual harvest.\n", flush=True)
 
     if platform_util.has_osascript() and platform_util.chrome_macos_installed():
         ae_cache = platform_util.APPLE_EVENTS_CACHE
@@ -282,10 +367,8 @@ def harvest_cookie() -> str:
             if "datadome=" in cookie:
                 return cookie
             if not LAST_MAC_NOJS:
-                # AppleScript window was waiting or failed — do not open a second browser.
                 return ""
 
-    # Linux: system Chrome (same captcha/stable-pass logic as Mac).
     if platform_util.is_linux():
         try:
             from linux_chrome_harvest import harvest_linux_fast
@@ -297,25 +380,9 @@ def harvest_cookie() -> str:
         except Exception:
             pass
 
-    # SeleniumBase fallback (Mac without Apple Events, etc.).
-    cookie = harvest_cookie_browser(try_auto=False)
+    cookie = harvest_cookie_browser(try_auto=auto_solve_capable())
     if "datadome=" in cookie:
         return cookie
-
-    if auto_solve_capable():
-        try:
-            import sb_mint
-
-            cookie = sb_mint.harvest_cookie()
-            if "datadome=" in cookie:
-                LAST_UA = sb_mint.LAST_UA
-                return cookie.strip()
-        except Exception as e:
-            print(f"[auto_refresh] Auto-solve failed ({e}).", file=sys.stderr)
-        try:
-            AUTO_CAP_CACHE.write_text(json.dumps(False))
-        except Exception:
-            pass
 
     return ""
 

@@ -145,6 +145,8 @@ def _is_challenge(r) -> bool:
     native captcha page ("CanLII calls upon users...") which is served with 200.
     """
     head = r.content[:4000].lower()
+    if is_ip_blocked_response(r):
+        return True
     if r.status_code in (403, 405):
         if b"please enable js" in head or b"captcha-delivery" in head or b"datadome" in head:
             return True
@@ -152,6 +154,16 @@ def _is_challenge(r) -> bool:
     if b"calls upon users accessing" in head or b"proceed with our captcha" in head:
         return True
     return False
+
+
+def is_ip_blocked_response(r) -> bool:
+    """True when DataDome has hard-blocked this IP (new cookies won't help yet)."""
+    head = (r.content[:8000] if r.content else b"").lower()
+    return (
+        b"temporarily blocked" in head
+        or b"access is temporarily blocked" in head
+        or b"you have been blocked" in head
+    )
 
 
 def fetch(session: requests.Session, url: str, *, tries: int = 5, referer: str | None = None):

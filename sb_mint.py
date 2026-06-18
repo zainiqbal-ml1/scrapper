@@ -33,7 +33,7 @@ def _mint() -> tuple[str, str]:
         sb.activate_cdp_mode(START_URL)
         sb.sleep(1.0)
 
-        def read_state() -> tuple[str, str, str, bool]:
+        def read_state() -> tuple[str, str, str, bool, str]:
             try:
                 src = sb.cdp.get_page_source() or ""
             except Exception:
@@ -48,15 +48,15 @@ def _mint() -> tuple[str, str]:
                 u = ""
             ch = browser_harvest.page_challenged_html(src)
             ok = browser_harvest.page_passed_html(src)
-            return c, u, ch, ok
+            return c, u, ch, ok, src
 
         while True:
-            cookie, ua, challenged, page_ok = read_state()
+            cookie, ua, challenged, page_ok, src = read_state()
 
             if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
                 break
 
-            if challenged:
+            if browser_harvest.is_datadome_slider_html(src):
                 if auto_attempts < SOLVE_ATTEMPTS:
                     auto_attempts += 1
                     try:
@@ -65,8 +65,12 @@ def _mint() -> tuple[str, str]:
                         print(f"[sb_mint] auto-solve attempt {auto_attempts}: {e}", file=sys.stderr)
                 if not prompt_shown:
                     prompt_shown = True
+                    print("\n>>> DataDome slider — auto-solving...\n", flush=True)
+            elif browser_harvest.page_challenged_html(src):
+                if not prompt_shown:
+                    prompt_shown = True
                     print(
-                        "\n>>> Captcha — solve it in Chrome (including a second step if shown).\n",
+                        "\n>>> CanLII captcha — solve the checkbox in Chrome.\n",
                         flush=True,
                     )
                 elif tracker.should_print_second_hint():

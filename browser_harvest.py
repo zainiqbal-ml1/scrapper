@@ -24,34 +24,59 @@ POLL_JS = (
     "const ddBlock=html.includes('captcha-delivery')||html.includes('geo.captcha-delivery.com')"
     "||(txt.includes('please enable js')&&html.includes('datadome')&&!txt.includes('canlii'));"
     "const canliiBlock=txt.includes('proceed with our captcha')||txt.includes('calls upon users accessing');"
+    "const ipBlock=txt.includes('temporarily blocked')||txt.includes('access is temporarily blocked')"
+    "||txt.includes('you have been blocked');"
     "const challenged=ddBlock||canliiBlock;"
     "const onCanlii=document.title.includes('CanLII')||txt.includes('canlii')||location.hostname.includes('canlii');"
-    "const passed=hasDD&&!challenged&&onCanlii;"
-    "return c+'|||'+(passed?'1':'0')+'|||'+(challenged?'1':'0');"
+    "const passed=hasDD&&!challenged&&!ipBlock&&onCanlii;"
+    "return c+'|||'+(passed?'1':'0')+'|||'+(challenged?'1':'0')+'|||'+(ipBlock?'1':'0');"
     "})()"
 )
 
 
-def parse_poll(raw: str) -> tuple[str, bool, bool]:
-    parts = (raw or "|||0|||0").split("|||")
+def parse_poll(raw: str) -> tuple[str, bool, bool, bool]:
+    parts = (raw or "|||0|||0|||0").split("|||")
     cookie = parts[0].strip() if parts else ""
     passed = len(parts) > 1 and parts[1].strip() == "1"
     challenged = len(parts) > 2 and parts[2].strip() == "1"
-    return cookie, passed, challenged
+    ip_blocked = len(parts) > 3 and parts[3].strip() == "1"
+    return cookie, passed, challenged, ip_blocked
 
 
 def page_challenged_html(src: str) -> bool:
+    return is_datadome_slider_html(src) or is_canlii_native_captcha_html(src)
+
+
+def is_datadome_slider_html(src: str) -> bool:
+    """DataDome slider interstitial (auto-solvable with PyAutoGUI)."""
     low = (src or "").lower()
     if "captcha-delivery" in low or "geo.captcha-delivery.com" in low:
-        return True
-    if "proceed with our captcha" in low or "calls upon users accessing" in low:
         return True
     if "please enable js" in low and "datadome" in low and "canlii" not in low[:2000]:
         return True
     return False
 
 
+def is_canlii_native_captcha_html(src: str) -> bool:
+    """CanLII checkbox captcha after DataDome — manual only."""
+    low = (src or "").lower()
+    return "proceed with our captcha" in low or "calls upon users accessing" in low
+
+
+def page_ip_blocked_html(src: str) -> bool:
+    """DataDome hard block — new cookies/windows will not help for ~1–2 minutes."""
+    low = (src or "").lower()
+    return (
+        "temporarily blocked" in low
+        or "access is temporarily blocked" in low
+        or "you have been blocked" in low
+        or ("blocked" in low and "datadome" in low and "canlii" not in low[:1500])
+    )
+
+
 def page_passed_html(src: str) -> bool:
+    if page_ip_blocked_html(src):
+        return False
     if page_challenged_html(src):
         return False
     return "canlii" in (src or "").lower()
@@ -134,26 +159,37 @@ def harvest_cookie_interactive(
             except Exception:
                 cookie = ua = ""
 
+            if page_ip_blocked_html(src):
+                _handle_ip_block_from_harvest(quiet=quiet)
+                break
+
             if tracker.update(
                 cookie=cookie, challenged=challenged, page_ok=page_passed_html(src),
             ):
                 break
 
             if challenged:
+                slider = is_datadome_slider_html(src)
+                native = is_canlii_native_captcha_html(src)
                 if not prompt_shown:
                     prompt_shown = True
-                    print(
-                        "\n>>> Captcha — solve it in Chrome (including a second step if shown).\n",
-                        flush=True,
-                    )
+                    if slider and try_auto_solve:
+                        print("\n>>> DataDome slider — auto-solving...\n", flush=True)
+                    else:
+                        print(
+                            "\n>>> Captcha — solve it in Chrome (including a second step if shown).\n",
+                            flush=True,
+                        )
                 elif tracker.should_print_second_hint() and not quiet:
                     print(">>> Second captcha — please solve it too.\n", flush=True)
-                if try_auto_solve:
+                if try_auto_solve and slider:
                     try:
                         sb.cdp.solve_captcha()
                     except Exception as e:
                         if not quiet:
                             print(f"[browser] auto-solve: {e}", file=sys.stderr)
+                elif native and not quiet and not try_auto_solve:
+                    pass  # manual CanLII checkbox — user solves in window
             elif not tracker.captcha_seen and time.monotonic() > fast_deadline:
                 if not quiet:
                     print(">>> Page did not load in time.", flush=True)
@@ -164,3 +200,10 @@ def harvest_cookie_interactive(
     if cookie and "datadome=" in cookie and not quiet:
         print(">>> Cookie captured — window closed.\n", flush=True)
     return cookie.strip(), ua.strip()
+
+
+def _handle_ip_block_from_harvest(*, quiet: bool = False) -> None:
+    """Delegate to auto_refresh IP cooldown (avoid import cycle at module load)."""
+    import auto_refresh
+
+    auto_refresh._handle_ip_block(quiet=quiet)
