@@ -25,6 +25,7 @@ bootstrap.ensure_session_file()
 import platform_util
 
 import canlii_scraper as cs
+import canlii_api
 import auto_refresh
 
 AUTO_STEPS = """
@@ -76,7 +77,15 @@ def ensure_session_or_refresh(juris: str) -> bool:
 
 
 def _discover_dbs_with_refresh(juris: str) -> dict:
-    """Fetch the database list for a jurisdiction, refreshing if blocked."""
+    """Fetch the database list for a jurisdiction (API when configured)."""
+    if canlii_api.enabled():
+        try:
+            print(f"Listing databases for {juris} (API)...", flush=True)
+            dbs = canlii_api.discover_databases(juris)
+            print(f"Found {len(dbs)} databases.\n", flush=True)
+            return dbs
+        except Exception as e:
+            print(f"[api] database list failed ({e}) — using website session\n", flush=True)
     if not ensure_session_or_refresh(juris):
         raise KeyboardInterrupt()
     while True:
@@ -170,11 +179,14 @@ def main() -> int:
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
           f"rate={rate:g} req/s | OS: {platform_util.system()} "
           f"| harvest: {platform_util.harvest_backend()}\n")
+    canlii_api.print_status()
     auto_refresh.print_harvest_capabilities(force_recheck=True)
     print(flush=True)
 
-    if juris != "all" and not ensure_session_or_refresh(juris):
+    if juris != "all" and not canlii_api.enabled() and not ensure_session_or_refresh(juris):
         return 130
+    if juris != "all" and canlii_api.enabled() and not cs.check_session(juris):
+        print("Session not verified yet — PDF downloads will refresh the cookie if blocked.\n", flush=True)
 
     return run_scrape(juris, db_list, years, rate)
 

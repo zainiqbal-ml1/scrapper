@@ -10,6 +10,8 @@ curl.txt
 .cookie_state.json
 .auto_solve_capable
 .mac_apple_events_ok
+.api_usage.json
+.env
 
 # python cache
 __pycache__/

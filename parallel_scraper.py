@@ -29,6 +29,7 @@ from curl_cffi import requests
 
 import auto_refresh
 import bootstrap
+import canlii_api
 import canlii_scraper as cs
 import platform_util
 
@@ -299,11 +300,21 @@ def manager_get(sessions: SessionCookies, limiter: RateLimiter, url: str, refere
 
 
 def _discover_databases(sessions: SessionCookies, limiter: RateLimiter, juris: str) -> dict[str, str]:
+    if canlii_api.enabled():
+        try:
+            return canlii_api.discover_databases(juris)
+        except Exception as e:
+            print(f"[api] database list failed ({e}) — using website", file=sys.stderr, flush=True)
     r = manager_get(sessions, limiter, f"{cs.BASE}/en/{juris}/")
     return cs.parse_databases_html(r.text, juris)
 
 
 def _get_years(sessions: SessionCookies, limiter: RateLimiter, juris: str, db: str) -> list[int]:
+    if canlii_api.enabled():
+        try:
+            return canlii_api.get_years(juris, db, cs.OUT_ROOT)
+        except Exception as e:
+            print(f"[api] year list failed ({e}) — using website", file=sys.stderr, flush=True)
     cache = cs.OUT_ROOT / ".years_cache" / f"{juris}_{db}.json"
     if cache.exists():
         try:
@@ -338,12 +349,7 @@ def _scrape_juris(sessions, limiter, juris, db_arg, args, grand) -> None:
                 print(f"  {juris}/{db}/{year}: already complete, skipping")
                 continue
             print(f"  {juris}/{db}/{year}: fetching decision list...", flush=True)
-            r = manager_get(sessions, limiter, f"{cs.BASE}/{juris}/{db}/nav/date/{year}/items",
-                            referer=f"{cs.BASE}/en/{juris}/{db}/")
-            try:
-                items = r.json()
-            except Exception:
-                items = []
+            items = cs.get_items(get_session(sessions), juris, db, year)
             if not items:
                 print(f"  {juris}/{db}/{year}: no items, skipping")
                 continue

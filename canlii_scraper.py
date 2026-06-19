@@ -47,6 +47,8 @@ import bootstrap
 bootstrap.ensure_session_file()
 from session import HEADERS, cookies_dict
 
+import canlii_api
+
 BASE = "https://www.canlii.org"
 IMPERSONATE = "chrome146"
 OUT_ROOT = Path("data")
@@ -200,7 +202,25 @@ def fetch(session: requests.Session, url: str, *, tries: int = 5, referer: str |
 
 
 def discover_databases(session: requests.Session, juris: str) -> dict[str, str]:
-    """All database codes -> names within a jurisdiction (from its landing page)."""
+    """All database codes -> names within a jurisdiction."""
+    if canlii_api.enabled():
+        try:
+            return canlii_api.discover_databases(juris)
+        except Exception as e:
+            print(f"[api] database list failed ({e}) — using website", file=sys.stderr, flush=True)
+    return _discover_databases_web(session, juris)
+
+
+def discover_databases_for_juris(juris: str, session: requests.Session | None = None) -> dict[str, str]:
+    """List databases; uses API when configured (no session/captcha needed)."""
+    if canlii_api.enabled():
+        return canlii_api.discover_databases(juris)
+    if session is None:
+        session = make_session()
+    return _discover_databases_web(session, juris)
+
+
+def _discover_databases_web(session: requests.Session, juris: str) -> dict[str, str]:
     r = fetch(session, f"{BASE}/en/{juris}/")
     return parse_databases_html(r.text, juris)
 
@@ -217,10 +237,19 @@ def parse_databases_html(html: str, juris: str) -> dict[str, str]:
 
 
 def get_years(session: requests.Session, juris: str, db: str) -> list[int]:
-    """All years that have decisions for a database (from the landing page).
+    """All years that have decisions for a database.
 
     Cached to disk so resumes don't spend cookie budget re-fetching it.
     """
+    if canlii_api.enabled():
+        try:
+            return canlii_api.get_years(juris, db, OUT_ROOT)
+        except Exception as e:
+            print(f"[api] year list failed ({e}) — using website", file=sys.stderr, flush=True)
+    return _get_years_web(session, juris, db)
+
+
+def _get_years_web(session: requests.Session, juris: str, db: str) -> list[int]:
     cache = OUT_ROOT / ".years_cache" / f"{juris}_{db}.json"
     if cache.exists():
         try:
@@ -236,7 +265,16 @@ def get_years(session: requests.Session, juris: str, db: str) -> list[int]:
 
 
 def get_items(session: requests.Session, juris: str, db: str, year: int) -> list[dict]:
-    """List of decisions for a database/year via the site's own JSON endpoint."""
+    """List of decisions for a database/year."""
+    if canlii_api.enabled():
+        try:
+            return canlii_api.get_items(juris, db, year, OUT_ROOT)
+        except Exception as e:
+            print(f"[api] item list failed ({e}) — using website", file=sys.stderr, flush=True)
+    return _get_items_web(session, juris, db, year)
+
+
+def _get_items_web(session: requests.Session, juris: str, db: str, year: int) -> list[dict]:
     r = fetch(session, f"{BASE}/{juris}/{db}/nav/date/{year}/items", referer=f"{BASE}/en/{juris}/{db}/")
     if r.status_code != 200:
         return []
