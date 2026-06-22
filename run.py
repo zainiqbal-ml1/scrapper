@@ -14,6 +14,7 @@ Interactive (recommended) - pick state, db(s), years, rate:
 Non-interactive (pass everything):
     python run.py --juris on --db all --years all
     python run.py --juris on --db onca onsc --years 2020-2024 --rate 3
+    python run.py --juris on --db onca --years 2024 --rate 0.1-0.2
     python run.py --juris all --db all --years all
 """
 import subprocess
@@ -108,17 +109,11 @@ def _discover_dbs_with_refresh(juris: str) -> dict:
             print("Session refreshed. Retrying...\n")
 
 
-def select_rate() -> float:
-    """Ask the max requests/second (single worker; throughput is rate-limited)."""
+def select_rate() -> str:
+    """Ask the max requests/second, or a range like 0.1-0.2."""
     dr = platform_util.default_rate()
-    raw = input(f"Max requests/second [{dr:g}]: ").strip()
-    try:
-        rate = float(raw) if raw else dr
-    except ValueError:
-        rate = dr
-    if rate <= 0:
-        rate = dr
-    return rate
+    raw = input(f"Requests/second or range [{dr:g}] (example 0.1-0.2): ").strip()
+    return raw or f"{dr:g}"
 
 
 def interactive_select():
@@ -151,7 +146,7 @@ def run_scrape(
 ) -> int:
     """Single-worker scrape with a request/sec cap; resume same settings on hard block."""
     cmd = [sys.executable, "parallel_scraper.py", "--juris", juris, "--db", *db_list,
-           "--years", years, "--workers", "1", "--rate", f"{rate:g}"]
+           "--years", years, "--workers", "1", "--rate", str(rate)]
     restarts = 0
     while True:
         rc = subprocess.call(cmd)
@@ -199,7 +194,7 @@ def main() -> int:
         # Non-interactive: read selection from flags (sensible defaults).
         juris = _extract_opt(args, "--juris", str, "on")
         years = _extract_opt(args, "--years", str, "all")
-        rate = _extract_opt(args, "--rate", float, platform_util.default_rate())
+        rate = _extract_opt(args, "--rate", str, f"{platform_util.default_rate():g}")
         restart_delay = _extract_opt(args, "--restart-delay", float, DEFAULT_RESTART_DELAY)
         max_restarts = _extract_opt(args, "--max-restarts", int, DEFAULT_MAX_RESTARTS)
         if "--db" not in args:
@@ -216,7 +211,7 @@ def main() -> int:
         max_restarts = DEFAULT_MAX_RESTARTS
 
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
-          f"rate={rate:g} req/s | OS: {platform_util.system()} "
+          f"rate={rate} req/s | OS: {platform_util.system()} "
           f"| harvest: {platform_util.harvest_backend()}\n"
           f"Restart on temporary block: delay={restart_delay:g}s "
           f"max={max_restarts if max_restarts > 0 else 'unlimited'}\n")

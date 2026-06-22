@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import sys
 import threading
@@ -59,48 +60,118 @@ def parse_cookie(cookie_str: str) -> dict:
     return jar
 
 
-class RateLimiter:
-    """Global minimum interval between any outbound requests."""
+def parse_rate_spec(rate_spec: str | float) -> tuple[float, float]:
+    """Return (min_rate, max_rate) from '0.2' or '0.1-0.2'."""
+    raw = str(rate_spec).strip()
+    if "-" in raw:
+        left, right = raw.split("-", 1)
+        a, b = float(left), float(right)
+        lo, hi = sorted((a, b))
+    else:
+        lo = hi = float(raw)
+    if lo <= 0 or hi <= 0:
+        raise ValueError("rate must be positive")
+    return lo, hi
 
-    def __init__(self, rate_per_sec: float):
-        self.min_interval = 1.0 / rate_per_sec if rate_per_sec > 0 else 0.0
+
+class RateLimiter:
+    """Global randomized minimum interval between outbound requests."""
+
+    def __init__(self, rate_spec: str | float):
+        self.min_rate, self.max_rate = parse_rate_spec(rate_spec)
         self._lock = threading.Lock()
         self._next = 0.0
 
     def wait(self):
-        if self.min_interval <= 0:
-            return
+        rate = random.uniform(self.min_rate, self.max_rate)
+        min_interval = 1.0 / rate
         with self._lock:
             now = time.monotonic()
             sleep_for = max(0.0, self._next - now)
-            self._next = max(now, self._next) + self.min_interval
+            self._next = max(now, self._next) + min_interval
         if sleep_for:
             time.sleep(sleep_for)
 
+    def label(self) -> str:
+        if self.min_rate == self.max_rate:
+            return f"{self.min_rate:g}"
+        return f"{self.min_rate:g}-{self.max_rate:g}"
+
 
 class SessionCookies:
-    """Sequential session: use session.py cookie until blocked, then harvest one fresh cookie."""
+    """Sequential session plus one background backup cookie."""
 
     MAX_HARVEST_RETRIES = 2
-    _harvest_lock = threading.Lock()
 
-    def harvest_fresh(self) -> str:
+    def __init__(self, *, backup_enabled: bool = True) -> None:
+        self._harvest_lock = threading.Lock()
+        self._backup_lock = threading.Lock()
+        self._backup_cookie: str | None = None
+        self._backup_thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._backup_enabled = backup_enabled
+        if backup_enabled:
+            self.kick_backup()
+
+    def harvest_fresh(self, *, quiet: bool = False) -> str:
         with self._harvest_lock:
-            print("\n>>> Harvesting a fresh cookie...\n", flush=True)
+            if not quiet:
+                print("\n>>> Harvesting a fresh cookie...\n", flush=True)
             for _ in range(self.MAX_HARVEST_RETRIES):
                 cookie = auto_refresh.harvest_cookie()
                 if cookie and "datadome=" in cookie:
-                    print(">>> Cookie ready.\n", flush=True)
+                    if not quiet:
+                        print(">>> Cookie ready.\n", flush=True)
                     return cookie
             raise RuntimeError("Could not harvest a fresh cookie (captcha not solved in time).")
 
+    def _fill_backup(self) -> None:
+        try:
+            cookie = self.harvest_fresh(quiet=True)
+            with self._backup_lock:
+                if not self._stop.is_set():
+                    self._backup_cookie = cookie
+                    print("Backup cookie ready.\n", flush=True)
+        except Exception as e:
+            if not self._stop.is_set():
+                print(f"[backup-cookie] harvest failed: {e}", file=sys.stderr, flush=True)
+
+    def kick_backup(self) -> None:
+        if not self._backup_enabled or self._stop.is_set():
+            return
+        with self._backup_lock:
+            if self._backup_cookie:
+                return
+            if self._backup_thread and self._backup_thread.is_alive():
+                return
+            self._backup_thread = threading.Thread(
+                target=self._fill_backup, daemon=True, name="backup-cookie",
+            )
+            self._backup_thread.start()
+
+    def _take_backup(self, current: str | None = None) -> str | None:
+        with self._backup_lock:
+            if self._backup_cookie and self._backup_cookie != current:
+                backup_cookie = self._backup_cookie
+                self._backup_cookie = None
+                return backup_cookie
+        return None
+
     def acquire_for_swap(self, current: str | None = None) -> str:
-        if COOKIE and COOKIE != current and "datadome=" in COOKIE:
-            return COOKIE
-        return self.harvest_fresh()
+        backup_cookie = self._take_backup(current)
+        if not backup_cookie and self._backup_thread and self._backup_thread.is_alive():
+            self._backup_thread.join()
+            backup_cookie = self._take_backup(current)
+        if backup_cookie:
+            print("    (using backup cookie)", flush=True)
+            self.kick_backup()
+            return backup_cookie
+        cookie = self.harvest_fresh()
+        self.kick_backup()
+        return cookie
 
     def stop(self) -> None:
-        pass
+        self._stop.set()
 
 
 _local = threading.local()
@@ -428,19 +499,22 @@ def main() -> int:
     ap.add_argument("--out", default="data")
     ap.add_argument("--workers", type=int, default=1,
                     help="Concurrent download workers (default 1; rate is the real ceiling)")
-    ap.add_argument("--rate", type=float, default=platform_util.default_rate(),
-                    help="Max total requests/sec across all workers")
+    ap.add_argument("--rate", default=f"{platform_util.default_rate():g}",
+                    help="Requests/sec, or a range like 0.1-0.2")
+    ap.add_argument("--no-backup-cookie", action="store_true",
+                    help="Disable the single background backup cookie harvest")
     args = ap.parse_args()
 
     cs.OUT_ROOT = Path(args.out)
-    sessions = SessionCookies()
     limiter = RateLimiter(args.rate)
 
     jurisdictions = list(cs.JURISDICTIONS.keys()) if args.juris == "all" else [args.juris]
     grand = {"total": 0, "downloaded": 0, "failed": 0}
 
-    print(f"Scrape: {args.workers} workers, {args.rate} req/s cap "
+    print(f"Scrape: {args.workers} workers, {limiter.label()} req/s "
+          f"| backup cookie: {'off' if args.no_backup_cookie else 'one'} "
           f"(structure: {cs.OUT_ROOT}/<state>/<db>/<year>/)\n")
+    sessions = SessionCookies(backup_enabled=not args.no_backup_cookie)
 
     try:
         for juris in jurisdictions:
