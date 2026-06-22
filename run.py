@@ -30,6 +30,7 @@ import platform_util
 import canlii_scraper as cs
 import canlii_api
 import auto_refresh
+import tor_util
 
 AUTO_STEPS = """
 ============================================================
@@ -143,10 +144,13 @@ def run_scrape(
     *,
     restart_delay: float = DEFAULT_RESTART_DELAY,
     max_restarts: int = DEFAULT_MAX_RESTARTS,
+    use_tor: bool = False,
 ) -> int:
     """Single-worker scrape with a request/sec cap; resume same settings on hard block."""
     cmd = [sys.executable, "parallel_scraper.py", "--juris", juris, "--db", *db_list,
            "--years", years, "--workers", "1", "--rate", str(rate)]
+    if use_tor:
+        cmd.append("--tor")
     restarts = 0
     while True:
         rc = subprocess.call(cmd)
@@ -184,6 +188,16 @@ def main() -> int:
     if "--use-api" not in args:
         os.environ["CANLII_IGNORE_API"] = "1"
 
+    use_tor = "--tor" in args or os.environ.get("CANLII_USE_TOR", "").strip().lower() in {
+        "1", "true", "yes",
+    }
+    if use_tor:
+        try:
+            tor_util.configure(use_tor=True)
+        except RuntimeError as e:
+            print(f"Tor error: {e}", file=sys.stderr)
+            return 1
+
     if not args:
         try:
             juris, db_list, years, rate = interactive_select()
@@ -216,6 +230,7 @@ def main() -> int:
           f"Restart on temporary block: delay={restart_delay:g}s "
           f"max={max_restarts if max_restarts > 0 else 'unlimited'}\n")
     canlii_api.print_status()
+    tor_util.print_status()
     auto_refresh.print_harvest_capabilities(force_recheck=True)
     print(flush=True)
 
@@ -231,6 +246,7 @@ def main() -> int:
         rate,
         restart_delay=restart_delay,
         max_restarts=max_restarts,
+        use_tor=use_tor,
     )
 
 

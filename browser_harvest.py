@@ -8,6 +8,8 @@ from __future__ import annotations
 import sys
 import time
 
+import tor_util
+
 START_URL = "https://www.canlii.org/en/on/"
 POLL_INTERVAL = 0.25
 FAST_EXIT_NO_CAPTCHA = 15   # seconds when no captcha ever appeared
@@ -144,7 +146,7 @@ def harvest_cookie_interactive(
 
     fast_deadline = time.monotonic() + FAST_EXIT_NO_CAPTCHA
 
-    with SB(uc=True, headed=True, locale="en") as sb:
+    with SB(uc=True, headed=True, locale="en", **tor_util.sb_proxy_kw()) as sb:
         sb.activate_cdp_mode(START_URL)
         sb.sleep(1.0)
         while True:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import sys
@@ -33,6 +34,7 @@ import bootstrap
 import canlii_api
 import canlii_scraper as cs
 import platform_util
+import tor_util
 
 bootstrap.ensure_session_file()
 from session import HEADERS, COOKIE
@@ -193,6 +195,7 @@ def get_session(sessions: SessionCookies, force_new: bool = False) -> requests.S
         cookies=parse_cookie(cookie), timeout=60,
     )
     _local.cookie = cookie
+    _local.proxy = tor_util.curl_proxy()
     return _local.session
 
 
@@ -204,7 +207,8 @@ def worker_get(sessions: SessionCookies, limiter: RateLimiter, url: str, referer
     while True:
         limiter.wait()
         try:
-            r = s.get(url, headers=headers)
+            proxy = getattr(_local, "proxy", None)
+            r = s.get(url, headers=headers, proxy=proxy) if proxy else s.get(url, headers=headers)
         except Exception:
             net_err += 1
             if net_err >= 2:
@@ -213,6 +217,8 @@ def worker_get(sessions: SessionCookies, limiter: RateLimiter, url: str, referer
         if r.status_code == 429 or cs._is_challenge(r):
             if cs.is_ip_blocked_response(r):
                 auto_refresh.mark_ip_blocked(quiet=False)
+                if tor_util.enabled() and tor_util.request_new_identity():
+                    raise NeedNewCookie()
                 raise AccessTemporarilyBlocked("access temporarily blocked")
             raise NeedNewCookie()
         return r
@@ -503,7 +509,16 @@ def main() -> int:
                     help="Requests/sec, or a range like 0.1-0.2")
     ap.add_argument("--no-backup-cookie", action="store_true",
                     help="Disable the single background backup cookie harvest")
+    ap.add_argument("--tor", action="store_true",
+                    help="Route downloads and harvest through local Tor (SOCKS 9050/9150)")
     args = ap.parse_args()
+
+    if args.tor or os.environ.get("CANLII_USE_TOR", "").strip().lower() in {"1", "true", "yes"}:
+        try:
+            tor_util.configure(use_tor=True)
+        except RuntimeError as e:
+            print(f"Tor error: {e}", file=sys.stderr)
+            return 1
 
     cs.OUT_ROOT = Path(args.out)
     limiter = RateLimiter(args.rate)
@@ -513,6 +528,7 @@ def main() -> int:
 
     print(f"Scrape: {args.workers} workers, {limiter.label()} req/s "
           f"| backup cookie: {'off' if args.no_backup_cookie else 'one'} "
+          f"| tor: {'on' if tor_util.enabled() else 'off'} "
           f"(structure: {cs.OUT_ROOT}/<state>/<db>/<year>/)\n")
     sessions = SessionCookies(backup_enabled=not args.no_backup_cookie)
 

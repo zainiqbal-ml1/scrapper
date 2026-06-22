@@ -9,6 +9,7 @@ from pathlib import Path
 
 import bootstrap
 import browser_harvest
+import tor_util
 
 SESSION_FILE = Path("session.py")
 COOKIE_STATE = Path(".cookie_state.json")
@@ -29,7 +30,7 @@ def _mint() -> tuple[str, str]:
     tracker = browser_harvest.StablePassTracker()
     fast_deadline = time.monotonic() + browser_harvest.FAST_EXIT_NO_CAPTCHA
 
-    with SB(uc=True, headed=True, locale="en") as sb:
+    with SB(uc=True, headed=True, locale="en", **tor_util.sb_proxy_kw()) as sb:
         sb.activate_cdp_mode(START_URL)
         sb.sleep(1.0)
         print("\n>>> DataDome slider — auto-solving (SeleniumBase + mouse)...\n", flush=True)

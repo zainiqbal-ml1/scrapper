@@ -17,6 +17,7 @@ from pathlib import Path
 import bootstrap
 import browser_harvest
 import platform_util
+import tor_util
 
 SESSION_FILE = Path("session.py")
 COOKIE_STATE = Path(".cookie_state.json")
