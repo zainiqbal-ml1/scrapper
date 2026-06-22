@@ -67,15 +67,15 @@ def _mint() -> tuple[str, str]:
                 if not prompt_shown:
                     prompt_shown = True
                     print(">>> Slider detected — dragging...\n", flush=True)
-            elif browser_harvest.page_challenged_html(src):
+            elif browser_harvest.is_canlii_native_captcha_html(src):
                 if not prompt_shown:
                     prompt_shown = True
-                    print(
-                        "\n>>> CanLII captcha — solve the checkbox in Chrome.\n",
-                        flush=True,
-                    )
+                    print("\n>>> CanLII captcha — auto-solving (checkbox + OCR)...\n", flush=True)
                 elif tracker.should_print_second_hint():
-                    print(">>> Second captcha — please solve it too.\n", flush=True)
+                    print(">>> Second captcha — trying again...\n", flush=True)
+                import captcha_auto
+
+                captcha_auto.try_solve(sb, quiet=False)
             elif not tracker.captcha_seen and time.monotonic() > fast_deadline:
                 break
 

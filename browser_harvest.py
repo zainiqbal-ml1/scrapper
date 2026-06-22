@@ -58,7 +58,7 @@ def is_datadome_slider_html(src: str) -> bool:
 
 
 def is_canlii_native_captcha_html(src: str) -> bool:
-    """CanLII checkbox captcha after DataDome — manual only."""
+    """CanLII reCAPTCHA / image captcha after DataDome."""
     low = (src or "").lower()
     return "proceed with our captcha" in low or "calls upon users accessing" in low
 
@@ -175,6 +175,8 @@ def harvest_cookie_interactive(
                     prompt_shown = True
                     if slider and try_auto_solve:
                         print("\n>>> DataDome slider — auto-solving...\n", flush=True)
+                    elif native:
+                        print("\n>>> CanLII captcha — auto-solving (checkbox + OCR)...\n", flush=True)
                     else:
                         print(
                             "\n>>> Captcha — solve it in Chrome (including a second step if shown).\n",
@@ -188,8 +190,10 @@ def harvest_cookie_interactive(
                     except Exception as e:
                         if not quiet:
                             print(f"[browser] auto-solve: {e}", file=sys.stderr)
-                elif native and not quiet and not try_auto_solve:
-                    pass  # manual CanLII checkbox — user solves in window
+                elif native:
+                    import captcha_auto
+
+                    captcha_auto.try_solve(sb, quiet=quiet)
             elif not tracker.captcha_seen and time.monotonic() > fast_deadline:
                 if not quiet:
                     print(">>> Page did not load in time.", flush=True)
