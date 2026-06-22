@@ -33,6 +33,8 @@ _client_lock = threading.Lock()
 
 def enabled() -> bool:
     bootstrap.load_env_file()
+    if os.environ.get("CANLII_IGNORE_API", "").strip() in {"1", "true", "yes"}:
+        return False
     return bool(os.environ.get("CANLII_API_KEY", "").strip())
 
 

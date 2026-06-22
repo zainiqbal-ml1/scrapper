@@ -17,7 +17,9 @@ Non-interactive (pass everything):
     python run.py --juris all --db all --years all
 """
 import subprocess
+import os
 import sys
+import time
 
 import bootstrap
 bootstrap.ensure_session_file()
@@ -36,6 +38,10 @@ AUTO_STEPS = """
    -> Otherwise a Chrome window opens - SOLVE THE SLIDER
       there; the new cookie is grabbed automatically.
 ============================================================"""
+
+TEMP_BLOCK_EXIT = 75
+DEFAULT_RESTART_DELAY = 60.0
+DEFAULT_MAX_RESTARTS = 20
 
 
 def _reload_session() -> None:
@@ -134,11 +140,37 @@ def interactive_select():
     return juris, chosen, years, rate
 
 
-def run_scrape(juris, db_list, years, rate) -> int:
-    """Single-worker scrape with a request/sec cap; retries failures."""
+def run_scrape(
+    juris,
+    db_list,
+    years,
+    rate,
+    *,
+    restart_delay: float = DEFAULT_RESTART_DELAY,
+    max_restarts: int = DEFAULT_MAX_RESTARTS,
+) -> int:
+    """Single-worker scrape with a request/sec cap; resume same settings on hard block."""
     cmd = [sys.executable, "parallel_scraper.py", "--juris", juris, "--db", *db_list,
            "--years", years, "--workers", "1", "--rate", f"{rate:g}"]
-    return subprocess.call(cmd)
+    restarts = 0
+    while True:
+        rc = subprocess.call(cmd)
+        if rc != TEMP_BLOCK_EXIT:
+            return rc
+
+        restarts += 1
+        if max_restarts > 0 and restarts > max_restarts:
+            print(f"Reached max restart count ({max_restarts}); stopping.", flush=True)
+            return rc
+
+        print(
+            f"\nAccess temporarily blocked. Restarting same run "
+            f"({restarts}/{max_restarts if max_restarts > 0 else 'unlimited'})...\n",
+            flush=True,
+        )
+        if restart_delay > 0:
+            print(f"Waiting {restart_delay:g}s before restart.", flush=True)
+            time.sleep(restart_delay)
 
 
 def _extract_opt(args, name, cast, default):
@@ -154,6 +186,8 @@ def _extract_opt(args, name, cast, default):
 
 def main() -> int:
     args = sys.argv[1:]
+    if "--use-api" not in args:
+        os.environ["CANLII_IGNORE_API"] = "1"
 
     if not args:
         try:
@@ -166,6 +200,8 @@ def main() -> int:
         juris = _extract_opt(args, "--juris", str, "on")
         years = _extract_opt(args, "--years", str, "all")
         rate = _extract_opt(args, "--rate", float, platform_util.default_rate())
+        restart_delay = _extract_opt(args, "--restart-delay", float, DEFAULT_RESTART_DELAY)
+        max_restarts = _extract_opt(args, "--max-restarts", int, DEFAULT_MAX_RESTARTS)
         if "--db" not in args:
             print("Provide --db <code...|all> (or run 'python run.py' for interactive mode).")
             return 1
@@ -175,10 +211,15 @@ def main() -> int:
             if tok.startswith("--"):
                 break
             db_list.append(tok)
+    if not args:
+        restart_delay = DEFAULT_RESTART_DELAY
+        max_restarts = DEFAULT_MAX_RESTARTS
 
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
           f"rate={rate:g} req/s | OS: {platform_util.system()} "
-          f"| harvest: {platform_util.harvest_backend()}\n")
+          f"| harvest: {platform_util.harvest_backend()}\n"
+          f"Restart on temporary block: delay={restart_delay:g}s "
+          f"max={max_restarts if max_restarts > 0 else 'unlimited'}\n")
     canlii_api.print_status()
     auto_refresh.print_harvest_capabilities(force_recheck=True)
     print(flush=True)
@@ -188,7 +229,14 @@ def main() -> int:
     if juris != "all" and canlii_api.enabled() and not cs.check_session(juris):
         print("Session not verified yet — PDF downloads will refresh the cookie if blocked.\n", flush=True)
 
-    return run_scrape(juris, db_list, years, rate)
+    return run_scrape(
+        juris,
+        db_list,
+        years,
+        rate,
+        restart_delay=restart_delay,
+        max_restarts=max_restarts,
+    )
 
 
 if __name__ == "__main__":

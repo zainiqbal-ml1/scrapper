@@ -43,6 +43,12 @@ class NeedNewCookie(Exception):
     pass
 
 
+class AccessTemporarilyBlocked(RuntimeError):
+    """CanLII/DataDome returned the hard temporary block page."""
+
+    pass
+
+
 def parse_cookie(cookie_str: str) -> dict:
     jar = {}
     for part in cookie_str.split(";"):
@@ -135,7 +141,8 @@ def worker_get(sessions: SessionCookies, limiter: RateLimiter, url: str, referer
             continue
         if r.status_code == 429 or cs._is_challenge(r):
             if cs.is_ip_blocked_response(r):
-                auto_refresh.mark_ip_blocked(quiet=True)
+                auto_refresh.mark_ip_blocked(quiet=False)
+                raise AccessTemporarilyBlocked("access temporarily blocked")
             raise NeedNewCookie()
         return r
 
@@ -215,7 +222,12 @@ def _run_downloads(
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(download_task, sessions, limiter, t) for t in tasks]
         for fut in as_completed(futs):
-            task, got, msg = fut.result()
+            try:
+                task, got, msg = fut.result()
+            except AccessTemporarilyBlocked:
+                for pending in futs:
+                    pending.cancel()
+                raise
             if got:
                 ok += 1
             else:
@@ -334,6 +346,26 @@ def _get_years(sessions: SessionCookies, limiter: RateLimiter, juris: str, db: s
     return years
 
 
+def _get_items(
+    sessions: SessionCookies, limiter: RateLimiter, juris: str, db: str, year: int,
+) -> list[dict]:
+    if canlii_api.enabled():
+        try:
+            return canlii_api.get_items(juris, db, year, cs.OUT_ROOT)
+        except Exception as e:
+            print(f"[api] item list failed ({e}) — using website", file=sys.stderr, flush=True)
+    r = manager_get(
+        sessions,
+        limiter,
+        f"{cs.BASE}/{juris}/{db}/nav/date/{year}/items",
+        referer=f"{cs.BASE}/en/{juris}/{db}/",
+    )
+    try:
+        return r.json()
+    except Exception:
+        return []
+
+
 def _scrape_juris(sessions, limiter, juris, db_arg, args, grand) -> None:
     out = cs.OUT_ROOT
     all_dbs = _discover_databases(sessions, limiter, juris)
@@ -349,7 +381,7 @@ def _scrape_juris(sessions, limiter, juris, db_arg, args, grand) -> None:
                 print(f"  {juris}/{db}/{year}: already complete, skipping")
                 continue
             print(f"  {juris}/{db}/{year}: fetching decision list...", flush=True)
-            items = cs.get_items(get_session(sessions), juris, db, year)
+            items = _get_items(sessions, limiter, juris, db, year)
             if not items:
                 print(f"  {juris}/{db}/{year}: no items, skipping")
                 continue
@@ -413,6 +445,9 @@ def main() -> int:
     try:
         for juris in jurisdictions:
             _scrape_juris(sessions, limiter, juris, args.db, args, grand)
+    except AccessTemporarilyBlocked:
+        print("\nAccess temporarily blocked — stopping this run for supervisor restart.", flush=True)
+        return 75
     finally:
         sessions.stop()
 
