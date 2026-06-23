@@ -26,7 +26,6 @@ def _mint() -> tuple[str, str]:
     ua = ""
     prompt_shown = False
     auto_attempts = 0
-    slider_next_at = 0.0
     tracker = browser_harvest.StablePassTracker()
     stall = browser_harvest.HarvestStallTracker()
 
@@ -81,19 +80,16 @@ def _mint() -> tuple[str, str]:
                 break
 
             if browser_harvest.is_datadome_slider_html(src):
-                now = time.monotonic()
                 if not prompt_shown:
                     prompt_shown = True
                     print(">>> Slider detected — dragging...\n", flush=True)
-                if auto_attempts < SOLVE_ATTEMPTS and now >= slider_next_at:
+                if auto_attempts < SOLVE_ATTEMPTS:
+                    auto_attempts += 1
                     import slider_auto
 
-                    if slider_auto.try_solve_datadome_slider(
+                    slider_auto.try_solve_datadome_slider(
                         sb, quiet=False, overshoot=8.0 + auto_attempts * 6,
-                    ):
-                        auto_attempts += 1
-                        slider_next_at = time.monotonic() + slider_auto.SOLVE_COOLDOWN_SEC
-                        sb.sleep(1.5)
+                    )
             elif browser_harvest.is_canlii_native_captcha_html(src):
                 if not prompt_shown:
                     prompt_shown = True
