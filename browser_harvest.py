@@ -273,11 +273,9 @@ def harvest_cookie_interactive(
                 elif tracker.should_print_second_hint() and not quiet:
                     print(">>> Second captcha — please solve it too.\n", flush=True)
                 if try_auto_solve and slider:
-                    try:
-                        sb.cdp.solve_captcha()
-                    except Exception as e:
-                        if not quiet:
-                            print(f"[browser] auto-solve: {e}", file=sys.stderr)
+                    import slider_auto
+
+                    slider_auto.try_solve_datadome_slider(sb, quiet=quiet)
                 elif native:
                     import captcha_auto
 
