@@ -12,9 +12,81 @@ import tor_util
 
 START_URL = "https://www.canlii.org/en/on/"
 POLL_INTERVAL = 0.25
-FAST_EXIT_NO_CAPTCHA = 15   # seconds when no captcha ever appeared
 STABLE_POLLS_NO_CAPTCHA = 2       # ~0.5s, no captcha path
 SETTLE_AFTER_CAPTCHA = 2.0        # seconds to watch for a second captcha step
+
+# Chrome / proxy failure pages (not time-based — detected from page content).
+_CONNECTIVITY_MARKERS = (
+    "err_proxy_connection_failed",
+    "err_tunnel_connection_failed",
+    "err_connection_timed_out",
+    "err_connection_reset",
+    "err_connection_refused",
+    "err_name_not_resolved",
+    "err_internet_disconnected",
+    "err_ssl_protocol_error",
+    "this site can't be reached",
+    "can't be reached",
+    "proxy server is refusing",
+    "network error",
+    "dns_probe_finished",
+    "unable to connect",
+)
+
+
+class HarvestConnectivityError(RuntimeError):
+    """Tor exit or browser cannot load CanLII — rotate and retry."""
+
+
+def page_connectivity_error(src: str, url: str = "") -> bool:
+    """True when the page shows a network/proxy failure (not a captcha)."""
+    low = (src or "").lower()
+    u = (url or "").lower()
+    if u.startswith("chrome-error://") or "chrome-error://" in low:
+        return True
+    return any(m in low for m in _CONNECTIVITY_MARKERS)
+
+
+class HarvestStallTracker:
+    """Poll-based stall detection (no wall-clock harvest timeout)."""
+
+    BLANK_STREAK_LIMIT = 6
+    CDP_FAIL_LIMIT = 3
+
+    def __init__(self) -> None:
+        self.blank_streak = 0
+        self.cdp_fails = 0
+
+    def check(
+        self,
+        *,
+        src: str,
+        url: str,
+        cookie: str,
+        challenged: bool,
+        cdp_ok: bool,
+    ) -> str | None:
+        if page_connectivity_error(src, url):
+            return "connectivity_error"
+        if not cdp_ok:
+            self.cdp_fails += 1
+            if self.cdp_fails >= self.CDP_FAIL_LIMIT:
+                return "browser_unreachable"
+        else:
+            self.cdp_fails = 0
+
+        if challenged or cookie_ready(cookie, challenged=False):
+            self.blank_streak = 0
+            return None
+
+        low = (src or "").lower()
+        if "canlii" not in low and len(low) < 800:
+            self.blank_streak += 1
+            if self.blank_streak >= self.BLANK_STREAK_LIMIT:
+                return "page_never_loaded"
+        else:
+            self.blank_streak = 0
+        return None
 
 # AppleScript + CDP poll: "cookie|||passed|||challenged"
 POLL_JS = (
@@ -141,29 +213,43 @@ def harvest_cookie_interactive(
     ua = ""
     prompt_shown = False
     tracker = StablePassTracker()
+    stall = HarvestStallTracker()
     if not quiet:
         print("\n>>> Opening Chrome...", flush=True)
 
-    fast_deadline = time.monotonic() + FAST_EXIT_NO_CAPTCHA
-
     with SB(uc=True, headed=True, locale="en", **tor_util.sb_proxy_kw()) as sb:
         sb.activate_cdp_mode(START_URL)
-        sb.sleep(1.0)
         while True:
+            cdp_ok = True
+            url = ""
             try:
                 src = sb.cdp.get_page_source() or ""
             except Exception:
                 src = ""
+                cdp_ok = False
+            try:
+                url = sb.cdp.evaluate("location.href") or ""
+            except Exception:
+                cdp_ok = False
             challenged = page_challenged_html(src)
             try:
                 cookie = sb.cdp.evaluate("document.cookie") or ""
                 ua = sb.cdp.evaluate("navigator.userAgent") or ""
             except Exception:
                 cookie = ua = ""
+                cdp_ok = False
 
             if page_ip_blocked_html(src):
                 _handle_ip_block_from_harvest(quiet=quiet)
                 break
+
+            stall_reason = stall.check(
+                src=src, url=url, cookie=cookie, challenged=challenged, cdp_ok=cdp_ok,
+            )
+            if stall_reason:
+                if not quiet:
+                    print(f">>> Harvest stalled ({stall_reason}) — trying another exit.\n", flush=True)
+                raise HarvestConnectivityError(stall_reason)
 
             if tracker.update(
                 cookie=cookie, challenged=challenged, page_ok=page_passed_html(src),
@@ -196,10 +282,6 @@ def harvest_cookie_interactive(
                     import captcha_auto
 
                     captcha_auto.try_solve(sb, quiet=quiet)
-            elif not tracker.captcha_seen and time.monotonic() > fast_deadline:
-                if not quiet:
-                    print(">>> Page did not load in time.", flush=True)
-                break
 
             time.sleep(POLL_INTERVAL)
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 import sys
-import time
 from pathlib import Path
 
 import bootstrap
@@ -15,7 +14,6 @@ SESSION_FILE = Path("session.py")
 COOKIE_STATE = Path(".cookie_state.json")
 START_URL = browser_harvest.START_URL
 SOLVE_ATTEMPTS = 6
-WAIT_PER_ATTEMPT = 2
 
 LAST_UA = ""
 
@@ -28,32 +26,47 @@ def _mint() -> tuple[str, str]:
     prompt_shown = False
     auto_attempts = 0
     tracker = browser_harvest.StablePassTracker()
-    fast_deadline = time.monotonic() + browser_harvest.FAST_EXIT_NO_CAPTCHA
+    stall = browser_harvest.HarvestStallTracker()
 
     with SB(uc=True, headed=True, locale="en", **tor_util.sb_proxy_kw()) as sb:
         sb.activate_cdp_mode(START_URL)
-        sb.sleep(1.0)
         print("\n>>> DataDome slider — auto-solving (SeleniumBase + mouse)...\n", flush=True)
 
-        def read_state() -> tuple[str, str, str, bool, str]:
+        def read_state() -> tuple[str, str, bool, bool, str, str, bool]:
+            cdp_ok = True
+            url = ""
             try:
                 src = sb.cdp.get_page_source() or ""
             except Exception:
                 src = ""
+                cdp_ok = False
+            try:
+                url = sb.cdp.evaluate("location.href") or ""
+            except Exception:
+                cdp_ok = False
             try:
                 c = sb.cdp.evaluate("document.cookie") or ""
             except Exception:
                 c = ""
+                cdp_ok = False
             try:
                 u = sb.cdp.evaluate("navigator.userAgent") or ""
             except Exception:
                 u = ""
+                cdp_ok = False
             ch = browser_harvest.page_challenged_html(src)
             ok = browser_harvest.page_passed_html(src)
-            return c, u, ch, ok, src
+            return c, u, ch, ok, src, url, cdp_ok
 
         while True:
-            cookie, ua, challenged, page_ok, src = read_state()
+            cookie, ua, challenged, page_ok, src, url, cdp_ok = read_state()
+
+            stall_reason = stall.check(
+                src=src, url=url, cookie=cookie, challenged=challenged, cdp_ok=cdp_ok,
+            )
+            if stall_reason:
+                print(f">>> Harvest stalled ({stall_reason}) — trying another exit.\n", flush=True)
+                raise browser_harvest.HarvestConnectivityError(stall_reason)
 
             if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
                 break
@@ -77,11 +90,9 @@ def _mint() -> tuple[str, str]:
                 import captcha_auto
 
                 captcha_auto.try_solve(sb, quiet=False)
-            elif not tracker.captcha_seen and time.monotonic() > fast_deadline:
-                break
 
             sb.sleep(
-                WAIT_PER_ATTEMPT if tracker.captcha_seen else browser_harvest.POLL_INTERVAL
+                2.0 if tracker.captcha_seen else browser_harvest.POLL_INTERVAL
             )
 
     return cookie.strip(), ua.strip()

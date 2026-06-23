@@ -176,12 +176,7 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
         activated = False
         prompt_shown = False
         tracker = browser_harvest.StablePassTracker()
-        fast_deadline = time.monotonic() + browser_harvest.FAST_EXIT_NO_CAPTCHA
-        no_captcha_deadline = (
-            time.monotonic() + (timeout_s or browser_harvest.FAST_EXIT_NO_CAPTCHA)
-            if timeout_s
-            else fast_deadline
-        )
+        stall = browser_harvest.HarvestStallTracker()
 
         while True:
             raw = _run_as(_as_poll(win_idx), quiet=True)
@@ -191,6 +186,15 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
                 _handle_ip_block(quiet=quiet)
                 break
             page_ok = poll_passed or browser_harvest.cookie_ready(cookie, challenged=False)
+
+            stall_reason = stall.check(
+                src=raw, url="", cookie=cookie, challenged=challenged, cdp_ok=bool(raw.strip()),
+            )
+            if stall_reason:
+                if not quiet:
+                    print(f">>> Harvest stalled ({stall_reason}) — closing window.\n", flush=True)
+                _run_as(AS_CLOSE % win_idx, quiet=True)
+                break
 
             if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
                 passed = True
@@ -208,8 +212,6 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
                     )
                 elif tracker.should_print_second_hint():
                     print(">>> Second captcha — please solve it too.\n", flush=True)
-            elif not tracker.captcha_seen and time.monotonic() > no_captcha_deadline:
-                break
             time.sleep(browser_harvest.POLL_INTERVAL)
 
         if passed or not tracker.captcha_seen:
@@ -313,9 +315,28 @@ def _try_sb_mint(*, quiet: bool = False) -> str:
         if "datadome=" in cookie:
             LAST_UA = sb_mint.LAST_UA
             return cookie.strip()
+    except browser_harvest.HarvestConnectivityError:
+        if not quiet:
+            print("[harvest] Bad exit — will rotate and retry.\n", flush=True)
     except Exception as e:
         if not quiet:
             print(f"[auto_refresh] Auto-solve failed ({e}).", file=sys.stderr, flush=True)
+    return ""
+
+
+def _harvest_via_selenium(*, try_auto: bool, quiet: bool) -> str:
+    global LAST_UA
+    try:
+        cookie, ua = browser_harvest.harvest_cookie_interactive(
+            try_auto_solve=try_auto, quiet=quiet,
+        )
+    except browser_harvest.HarvestConnectivityError:
+        if not quiet:
+            print("[harvest] Bad exit — will rotate and retry.\n", flush=True)
+        return ""
+    if "datadome=" in cookie:
+        LAST_UA = ua
+        return cookie
     return ""
 
 
@@ -339,19 +360,33 @@ def harvest_cookie() -> str:
     """Harvest a validated cookie — auto slider first when permitted."""
     global LAST_UA
     LAST_UA = ""
+    max_tries = 5 if tor_util.enabled() else 1
 
-    if tor_util.enabled():
-        tor_util.rotate_for_new_cookie()
-        print("Tor on — routing cookie harvest through Tor (SeleniumBase).\n", flush=True)
-        cookie = _try_sb_mint(quiet=False)
+    for attempt in range(max_tries):
+        if tor_util.enabled():
+            tor_util.rotate_for_new_cookie()
+            if not tor_util.can_reach_canlii():
+                print("[tor] Exit cannot reach CanLII — trying another...\n", flush=True)
+                continue
+            if attempt == 0:
+                print("Tor on — routing cookie harvest through Tor (SeleniumBase).\n", flush=True)
+
+            cookie = _try_sb_mint(quiet=False)
+            if "datadome=" in cookie:
+                return cookie
+            cookie = _harvest_via_selenium(try_auto=True, quiet=False)
+            if "datadome=" in cookie:
+                return cookie
+            continue
+
+        cookie = _try_auto_slider_first(quiet=False)
         if "datadome=" in cookie:
             return cookie
-        cookie = harvest_cookie_browser(try_auto=True, quiet=False)
-        return cookie if "datadome=" in cookie else ""
+        break
 
-    cookie = _try_auto_slider_first(quiet=False)
-    if "datadome=" in cookie:
-        return cookie
+    if tor_util.enabled():
+        return ""
+
     if platform_util.is_macos():
         print("Auto slider did not finish — opening manual harvest.\n", flush=True)
     elif not auto_solve_capable(force_recheck=True):

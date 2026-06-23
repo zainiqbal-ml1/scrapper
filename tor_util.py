@@ -243,6 +243,44 @@ def rotate_for_new_cookie(*, quiet: bool = False) -> bool:
     return False
 
 
+def can_reach_canlii() -> bool:
+    """Quick probe: can the current route load CanLII (before opening Chrome)?"""
+    from curl_cffi import requests
+
+    proxy = curl_proxy()
+    try:
+        r = requests.get(
+            "https://www.canlii.org/en/on/",
+            proxy=proxy,
+            timeout=15,
+            impersonate="chrome146",
+            allow_redirects=True,
+        )
+        text = (r.text or "")[:16000]
+        low = text.lower()
+        if any(m in low for m in (
+            "err_proxy", "err_tunnel", "can't be reached", "network error",
+        )):
+            return False
+        return r.status_code in (200, 403, 429) or "canlii" in low
+    except Exception:
+        return False
+
+
+def ensure_exit_can_reach_canlii(*, quiet: bool = False) -> bool:
+    """Rotate until curl can reach CanLII through the current Tor exit."""
+    if not enabled():
+        return True
+    for attempt in range(_MAX_ROTATE_ATTEMPTS):
+        if can_reach_canlii():
+            return True
+        if not quiet:
+            print("[tor] Exit cannot reach CanLII — rotating...", flush=True)
+        if not rotate_for_new_cookie(quiet=quiet) and attempt + 1 >= _MAX_ROTATE_ATTEMPTS:
+            break
+    return can_reach_canlii()
+
+
 def curl_proxy() -> str | None:
     return socks_url() if enabled() else None
 

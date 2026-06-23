@@ -10,6 +10,8 @@ from browser_harvest import (
     POLL_INTERVAL,
     POLL_JS,
     START_URL,
+    HarvestConnectivityError,
+    HarvestStallTracker,
     StablePassTracker,
     cookie_ready,
     page_challenged_html,
@@ -98,7 +100,7 @@ def harvest_linux_fast(*, quiet: bool = True) -> tuple[str, str]:
     passed = False
     prompt_shown = False
     tracker = StablePassTracker()
-    fast_deadline = time.monotonic() + 15
+    stall = HarvestStallTracker()
 
     try:
         opts = Options()
@@ -122,6 +124,18 @@ def harvest_linux_fast(*, quiet: bool = True) -> tuple[str, str]:
                 _handle_ip_block_from_harvest(quiet=quiet)
                 break
 
+            try:
+                url = driver.current_url or ""
+            except Exception:
+                url = ""
+            stall_reason = stall.check(
+                src=src, url=url, cookie=cookie, challenged=challenged, cdp_ok=True,
+            )
+            if stall_reason:
+                if not quiet:
+                    print(f">>> Harvest stalled ({stall_reason}).\n", flush=True)
+                raise HarvestConnectivityError(stall_reason)
+
             page_ok = page_ok or cookie_ready(cookie, challenged=False)
 
             if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
@@ -137,8 +151,6 @@ def harvest_linux_fast(*, quiet: bool = True) -> tuple[str, str]:
                     )
                 elif tracker.should_print_second_hint():
                     print(">>> Second captcha — please solve it too.\n", flush=True)
-            elif not tracker.captcha_seen and time.monotonic() > fast_deadline:
-                break
 
             time.sleep(POLL_INTERVAL)
     finally:
