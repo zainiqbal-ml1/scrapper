@@ -19,6 +19,7 @@ from datetime import date
 from pathlib import Path
 
 import bootstrap
+import tor_util
 
 API_BASE = "https://api.canlii.org/v1"
 MAX_RESULT_COUNT = 10_000
@@ -98,6 +99,22 @@ class CanLIIClient:
         url = f"{API_BASE}{path}?{urllib.parse.urlencode(q)}"
         req = urllib.request.Request(url, headers={"User-Agent": "canlii-scraper/1.0"})
         try:
+            proxy = tor_util.curl_proxy()
+            if proxy:
+                from curl_cffi import requests as curl_requests
+
+                r = curl_requests.get(
+                    url,
+                    proxy=proxy,
+                    timeout=60,
+                    impersonate="chrome146",
+                    headers={"User-Agent": "canlii-scraper/1.0"},
+                )
+                if r.status_code >= 400:
+                    raise urllib.error.HTTPError(
+                        url, r.status_code, r.reason or "", r.headers, None
+                    )
+                return json.loads(r.text)
             with urllib.request.urlopen(req, timeout=60) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:

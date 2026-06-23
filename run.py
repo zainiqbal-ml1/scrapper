@@ -8,13 +8,14 @@ skipped).
 
 Run it in your OWN terminal (it needs to read your keypresses).
 
-Interactive (recommended) - pick state, db(s), years, rate:
+Interactive (recommended) - pick state, db(s), years, rate, Tor:
     python run.py
 
 Non-interactive (pass everything):
     python run.py --juris on --db all --years all
     python run.py --juris on --db onca onsc --years 2020-2024 --rate 3
     python run.py --juris on --db onca --years 2024 --rate 0.1-0.2
+    python run.py --tor --juris on --db onca --years 2024 --rate 0.1-0.2
     python run.py --juris all --db all --years all
 """
 import subprocess
@@ -117,23 +118,49 @@ def select_rate() -> str:
     return raw or f"{dr:g}"
 
 
-def interactive_select():
-    """Prompt for jurisdiction -> db(s) -> years -> rate.
+def select_tor(*, default: bool | None = None) -> bool:
+    """Ask whether to route CanLII traffic through local Tor."""
+    if default is not None:
+        return default
+    raw = input("Route through Tor? [y/N] (Tor Browser on port 9150): ").strip().lower()
+    return raw in {"y", "yes", "1"}
 
-    Returns (juris, db_list, years, rate).
+
+def _tor_from_flags(args: list[str]) -> bool | None:
+    if "--tor" in args:
+        return True
+    env = os.environ.get("CANLII_USE_TOR", "").strip().lower()
+    if env in {"1", "true", "yes"}:
+        return True
+    return None
+
+
+def interactive_select(*, tor_default: bool | None = None):
+    """Prompt for jurisdiction -> db(s) -> years -> rate -> Tor.
+
+    Returns (juris, db_list, years, rate, use_tor).
     """
     juris = cs.select_jurisdiction()
     print(flush=True)  # newline after selection so status line is visible
+    use_tor = select_tor(default=tor_default)
+    if use_tor:
+        try:
+            tor_util.configure(use_tor=True)
+        except RuntimeError as e:
+            print(f"Tor error: {e}", file=sys.stderr)
+            print("Continuing without Tor.\n", flush=True)
+            use_tor = False
+            tor_util.configure(use_tor=False)
     if juris == "all":
         years = cs.select_years()
         rate = select_rate()
         print("\nAll jurisdictions selected -> every database.")
-        return "all", ["all"], years, rate
+        return "all", ["all"], years, rate, use_tor
     dbs = _discover_dbs_with_refresh(juris)
     chosen = cs.select_databases(dbs)
     years = cs.select_years()
     rate = select_rate()
-    return juris, chosen, years, rate
+    return juris, chosen, years, rate, use_tor
 
 
 def run_scrape(
@@ -188,23 +215,24 @@ def main() -> int:
     if "--use-api" not in args:
         os.environ["CANLII_IGNORE_API"] = "1"
 
-    use_tor = "--tor" in args or os.environ.get("CANLII_USE_TOR", "").strip().lower() in {
-        "1", "true", "yes",
-    }
-    if use_tor:
-        try:
-            tor_util.configure(use_tor=True)
-        except RuntimeError as e:
-            print(f"Tor error: {e}", file=sys.stderr)
-            return 1
+    tor_flag = _tor_from_flags(args)
 
     if not args:
         try:
-            juris, db_list, years, rate = interactive_select()
+            juris, db_list, years, rate, use_tor = interactive_select(tor_default=tor_flag)
         except (KeyboardInterrupt, EOFError):
             print("\nCancelled.")
             return 130
+        restart_delay = DEFAULT_RESTART_DELAY
+        max_restarts = DEFAULT_MAX_RESTARTS
     else:
+        use_tor = bool(tor_flag)
+        if use_tor:
+            try:
+                tor_util.configure(use_tor=True)
+            except RuntimeError as e:
+                print(f"Tor error: {e}", file=sys.stderr)
+                return 1
         # Non-interactive: read selection from flags (sensible defaults).
         juris = _extract_opt(args, "--juris", str, "on")
         years = _extract_opt(args, "--years", str, "all")
@@ -220,9 +248,6 @@ def main() -> int:
             if tok.startswith("--"):
                 break
             db_list.append(tok)
-    if not args:
-        restart_delay = DEFAULT_RESTART_DELAY
-        max_restarts = DEFAULT_MAX_RESTARTS
 
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
           f"rate={rate} req/s | OS: {platform_util.system()} "
@@ -231,6 +256,7 @@ def main() -> int:
           f"max={max_restarts if max_restarts > 0 else 'unlimited'}\n")
     canlii_api.print_status()
     tor_util.print_status()
+    tor_util.print_ip()
     auto_refresh.print_harvest_capabilities(force_recheck=True)
     print(flush=True)
 

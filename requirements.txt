@@ -1,5 +1,6 @@
 curl_cffi>=0.7
 seleniumbase>=4.49
 Pillow>=11
-ddddocr>=1.5
 PySocks>=1.7
+ddddocr>=1.5
+stem>=1.8

@@ -37,6 +37,20 @@ import platform_util
 import tor_util
 
 bootstrap.ensure_session_file()
+
+
+def _sync_session_from_disk() -> None:
+    """Reload session.py after cookie harvest (UA must match datadome cookie)."""
+    global HEADERS, COOKIE
+    import importlib
+    import session as _s
+
+    importlib.reload(_s)
+    HEADERS = _s.HEADERS
+    COOKIE = _s.COOKIE
+    cs.HEADERS = _s.HEADERS
+
+
 from session import HEADERS, COOKIE
 
 
@@ -122,8 +136,18 @@ class SessionCookies:
             for _ in range(self.MAX_HARVEST_RETRIES):
                 cookie = auto_refresh.harvest_cookie()
                 if cookie and "datadome=" in cookie:
+                    auto_refresh.update_session_cookie(
+                        cookie, getattr(auto_refresh, "LAST_UA", "") or "",
+                    )
+                    _sync_session_from_disk()
                     if not quiet:
                         print(">>> Cookie ready.\n", flush=True)
+                    if tor_util.enabled():
+                        tor_util.mark_cookie_ip()
+                        if not quiet:
+                            print(f"    (cookie on {tor_util.ip_label()})", flush=True)
+                    else:
+                        tor_util.invalidate_ip()
                     return cookie
             raise RuntimeError("Could not harvest a fresh cookie (captcha not solved in time).")
 
@@ -179,6 +203,14 @@ class SessionCookies:
 _local = threading.local()
 
 
+def _request_headers() -> dict:
+    headers = dict(HEADERS)
+    ua = getattr(auto_refresh, "LAST_UA", "") or headers.get("user-agent", "")
+    if ua:
+        headers["user-agent"] = ua
+    return headers
+
+
 def get_session(sessions: SessionCookies, force_new: bool = False) -> requests.Session:
     current_cookie = getattr(_local, "cookie", None)
 
@@ -191,11 +223,14 @@ def get_session(sessions: SessionCookies, force_new: bool = False) -> requests.S
     cookie = sessions.acquire_for_swap(current_cookie) if force_new else COOKIE
 
     _local.session = requests.Session(
-        impersonate=cs.IMPERSONATE, headers=HEADERS,
-        cookies=parse_cookie(cookie), timeout=60,
+        impersonate=cs.IMPERSONATE,
+        headers=_request_headers(),
+        cookies=parse_cookie(cookie),
+        timeout=60,
     )
     _local.cookie = cookie
-    _local.proxy = tor_util.curl_proxy()
+    if force_new and tor_util.enabled():
+        print(f"    ({tor_util.ip_label()})", flush=True)
     return _local.session
 
 
@@ -207,8 +242,7 @@ def worker_get(sessions: SessionCookies, limiter: RateLimiter, url: str, referer
     while True:
         limiter.wait()
         try:
-            proxy = getattr(_local, "proxy", None)
-            r = s.get(url, headers=headers, proxy=proxy) if proxy else s.get(url, headers=headers)
+            r = tor_util.session_get(s, url, headers=headers)
         except Exception:
             net_err += 1
             if net_err >= 2:
@@ -311,10 +345,13 @@ def _run_downloads(
                 task["_fail_msg"] = msg
                 failed.append(task)
             done += 1
-            bar = f"  {label}: [{done}/{total}] ok={ok} fail={len(failed)}"
-            sys.stdout.write("\r" + bar.ljust(72))
+            bar = (
+                f"  {label}: [{done}/{total}] ok={ok} fail={len(failed)} "
+                f"| {tor_util.ip_label()}"
+            )
+            sys.stdout.write("\r" + bar.ljust(96))
             sys.stdout.flush()
-    sys.stdout.write("\r" + " " * 72 + "\r")
+    sys.stdout.write("\r" + " " * 96 + "\r")
     return ok, failed
 
 
@@ -526,11 +563,23 @@ def main() -> int:
     jurisdictions = list(cs.JURISDICTIONS.keys()) if args.juris == "all" else [args.juris]
     grand = {"total": 0, "downloaded": 0, "failed": 0}
 
+    tor_on = tor_util.enabled()
+    backup_enabled = not args.no_backup_cookie and not tor_on
+    if tor_on and not args.no_backup_cookie:
+        print(
+            "Backup cookie: auto-disabled with Tor "
+            "(backup would be minted on a different exit IP).\n",
+            flush=True,
+        )
+
     print(f"Scrape: {args.workers} workers, {limiter.label()} req/s "
-          f"| backup cookie: {'off' if args.no_backup_cookie else 'one'} "
-          f"| tor: {'on' if tor_util.enabled() else 'off'} "
+          f"| backup cookie: {'off' if not backup_enabled else 'one'} "
+          f"| tor: {'on' if tor_on else 'off'} "
           f"(structure: {cs.OUT_ROOT}/<state>/<db>/<year>/)\n")
-    sessions = SessionCookies(backup_enabled=not args.no_backup_cookie)
+    tor_util.print_ip()
+    if tor_on:
+        tor_util.mark_cookie_ip()
+    sessions = SessionCookies(backup_enabled=backup_enabled)
 
     try:
         for juris in jurisdictions:

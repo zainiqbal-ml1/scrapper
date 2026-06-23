@@ -58,6 +58,8 @@ def wait_ip_cooldown(*, quiet: bool = False) -> None:
 
 def _handle_ip_block(*, quiet: bool = False) -> None:
     mark_ip_blocked(quiet=quiet)
+    if tor_util.enabled():
+        tor_util.request_new_identity(quiet=quiet)
 
 
 def _run_as(script: str, *, quiet: bool = False) -> str:
@@ -338,6 +340,15 @@ def harvest_cookie() -> str:
     global LAST_UA
     LAST_UA = ""
 
+    if tor_util.enabled():
+        tor_util.rotate_for_new_cookie()
+        print("Tor on — routing cookie harvest through Tor (SeleniumBase).\n", flush=True)
+        cookie = _try_sb_mint(quiet=False)
+        if "datadome=" in cookie:
+            return cookie
+        cookie = harvest_cookie_browser(try_auto=True, quiet=False)
+        return cookie if "datadome=" in cookie else ""
+
     cookie = _try_auto_slider_first(quiet=False)
     if "datadome=" in cookie:
         return cookie
@@ -385,6 +396,8 @@ def update_session_cookie(cookie: str, ua: str = "") -> None:
     SESSION_FILE.write_text(src)
     if COOKIE_STATE.exists():
         COOKIE_STATE.unlink()
+    if tor_util.enabled():
+        tor_util.mark_cookie_ip()
 
 
 def main() -> int:

@@ -13,11 +13,12 @@ Examples: `data/on/onca/2024/...`, `data/ca/scc/2023/...`
 
 ## Requirements
 
-- Python 3.11+ (3.12 recommended)
+- Python 3.11+ (3.12 recommended; 3.14 works)
 - Google Chrome or Chromium
-- macOS, Linux, or Windows with a graphical display (for cookie refresh / captcha)
+- macOS, Linux, or Windows with a display (for captcha / cookie harvest)
+- Optional: [Tor Browser](https://www.torproject.org/) for `--tor` routing
 
-## Setup (new machine)
+## Setup
 
 ```bash
 git clone https://github.com/zainiqbal-ml1/scrapper.git
@@ -31,36 +32,14 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-On first run, `session.py` is created automatically from `session.py.template`. A browser window opens so you can pass DataDome/captcha and mint a live cookie.
+On first run, `session.py` is created from `session.py.template`. A browser window opens to pass DataDome/captcha and mint a live cookie.
 
-### Linux extras
+### Linux headless server
 
 ```bash
-# Ubuntu/Debian
-sudo apt install google-chrome-stable   # or chromium-browser
-
-# headless server (no display)
-sudo apt install xvfb
+sudo apt install google-chrome-stable xvfb
 xvfb-run python run.py
 ```
-
-### Performance and rate limiting
-
-CanLII's anti-bot (DataDome) throttles by **IP address**, so the scraper uses a **single download worker** and controls throughput with **requests/second**.
-
-- A **cookie pool** keeps **3–4 cookies** ready via **one background harvest at a time** (not parallel browser spam).
-- **Proactive rotation** at ~75 downloads before DataDome burns the cookie.
-- On **429/403** the worker grabs the **next pooled cookie** and retries (network blips retry with the same cookie).
-- **Mac without Apple Events**: no silent background windows — harvest only when the pool is actually empty.
-- Pick a `--rate` your IP tolerates. Start around `2`-`4`; lower it if you see frequent 429s.
-
-```bash
-python run.py --juris on --db onca --years 2024 --rate 3
-```
-
-If downloads stall after solving captcha, enable **Chrome > View > Developer > Allow JavaScript from Apple Events** (required for automatic cookie capture on macOS).
-
-Also allow **Terminal/Cursor to control Google Chrome** when macOS prompts (System Settings > Privacy & Security > Automation). Without this, the scraper falls back to SeleniumBase — a visible Chrome window you solve manually.
 
 ## Run
 
@@ -70,44 +49,58 @@ Interactive (recommended):
 python run.py
 ```
 
-You will be prompted for:
-
-1. Jurisdiction (`on`, `ca`, `bc`, … or `all`)
-2. Database(s) (numbers/codes or `all`)
-3. Years (`all`, `2024`, `2020-2024`, etc.)
-4. Max requests/second
+Prompts: jurisdiction → Tor yes/no → database(s) → years → rate.
 
 Non-interactive:
 
 ```bash
-python run.py --juris on --db onca onsc --years 2020-2024 --rate 3
+python run.py --juris on --db onca --years 2024 --rate 0.1-0.2
+python run.py --tor --juris on --db onca --years 2024 --rate 0.1-0.2
 python run.py --juris ca --db all --years all
 ```
+
+### Tor
+
+- Interactive: answer `y` when asked, or pass `--tor` / `CANLII_USE_TOR=1`
+- Requires Tor Browser (port 9150) or `tor` daemon (port 9050)
+- All CanLII HTTP and cookie harvest goes through Tor; backup cookies are auto-disabled (different exit IPs)
+- Outbound IP is shown at startup and on the download progress line; it updates only when the cookie is refreshed
+
+### Rate limiting
+
+DataDome throttles by IP. Use one worker and a low rate (e.g. `0.1-0.2` req/s with Tor, `2-4` on a stable home IP).
 
 ### Other commands
 
 ```bash
-# list jurisdictions
 python canlii_scraper.py --list-jurisdictions
-
-# list databases in a jurisdiction
 python canlii_scraper.py --juris bc --list-dbs
-
-# test session
 python canlii_scraper.py --check
-
-# refresh session manually
 python auto_refresh.py
+python set_session.py          # paste a Copy-as-cURL export
 ```
 
 ## How it works
 
-- Downloads use `curl_cffi` with Chrome TLS impersonation and a `datadome` cookie.
-- When cookies run out, a **cookie pool** harvests replacements in the background (up to 2 parallel on macOS, 1 on Linux).
+- PDF downloads use `curl_cffi` with Chrome TLS impersonation and a `datadome` cookie.
+- On 429/403, a fresh cookie is harvested (SeleniumBase auto-slider when permitted).
 - Existing PDFs and completed years are skipped on resume.
-- Failed downloads are retried until they succeed.
+- Failed downloads retry until permanent (404, not a PDF) or success.
 
-## Notes
+## Local files (not committed)
 
-- `data/` and `session.py` are not committed (scraped files and live cookies stay local).
-- If blocked, solve the captcha in the Chrome window that appears; scraping resumes automatically.
+| Path | Purpose |
+|------|---------|
+| `session.py` | Live cookie + user-agent |
+| `data/` | Scraped PDFs and JSON |
+| `.env` | Optional `CANLII_API_KEY` |
+| `.cookie_state.json` | Rotated cookie cache |
+| `.auto_solve_capable` | Mac auto-slider capability cache |
+
+## macOS permissions
+
+- **Chrome > View > Developer > Allow JavaScript from Apple Events** — faster cookie capture
+- **System Settings > Privacy > Automation** — allow Terminal/Cursor to control Chrome
+- **Screen Recording + Accessibility** — for PyAutoGUI slider auto-solve
+
+Without these, a visible Chrome window opens for manual captcha solve.

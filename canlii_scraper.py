@@ -48,6 +48,7 @@ bootstrap.ensure_session_file()
 from session import HEADERS, cookies_dict
 
 import canlii_api
+import tor_util
 
 BASE = "https://www.canlii.org"
 IMPERSONATE = "chrome146"
@@ -131,7 +132,7 @@ def check_session(juris: str = "on") -> bool:
             cookies=_load_cookies(),
             timeout=CHECK_TIMEOUT,
         )
-        r = session.get(f"{BASE}/en/{juris}/")
+        r = tor_util.session_get(session, f"{BASE}/en/{juris}/")
         if _is_challenge(r) or r.status_code != 200:
             return False
         dbs = parse_databases_html(r.text, juris)
@@ -178,7 +179,7 @@ def fetch(session: requests.Session, url: str, *, tries: int = 5, referer: str |
     net_err = 0
     while True:
         try:
-            r = session.get(url, headers=headers)
+            r = tor_util.session_get(session, url, headers=headers)
         except Exception as e:  # connection reset / TLS hiccup
             net_err += 1
             if net_err > tries:

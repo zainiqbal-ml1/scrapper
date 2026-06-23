@@ -25,3 +25,6 @@ __pycache__/
 downloaded_files/
 scrape_run.log
 *.log
+*.crdownload
+driver_fixing.lock
+pipfinding.lock
