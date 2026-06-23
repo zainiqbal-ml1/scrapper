@@ -10,12 +10,10 @@ SLIDER_SEL = "div.slider"
 TARGET_SEL = "div.sliderTarget"
 
 
-def try_solve_datadome_slider(sb, *, quiet: bool = False, overshoot: float = 12.0) -> bool:
-    """Drag the DataDome slider to the end of the track on the CanLII tab."""
+def try_solve_datadome_slider(sb, *, quiet: bool = False, overshoot: float = 10.0) -> bool:
+    """Drag the DataDome slider to the end of the track. Returns True if drag ran."""
     cdp = sb.cdp if hasattr(sb, "cdp") else sb
     src = cdp.get_page_source() or ""
-    if browser_harvest.page_ip_blocked_html(src):
-        return False
     if not browser_harvest.is_datadome_slider_html(src):
         return False
     if not cdp.is_element_visible(IFRAME_SEL):
@@ -32,33 +30,29 @@ def try_solve_datadome_slider(sb, *, quiet: bool = False, overshoot: float = 12.
 
     if not quiet:
         dist = int(x2 - x1)
-        print(f">>> Slider drag on CanLII page ({dist}px)...\n", flush=True)
+        print(f">>> Slider drag ({dist}px)...\n", flush=True)
 
     cdp.bring_active_window_to_front()
     time.sleep(0.08)
-    cdp.gui_drag_drop_points(x1, y1, x2, y2, timeframe=1.25)
+    cdp.gui_drag_drop_points(x1, y1, x2, y2, timeframe=1.15)
     time.sleep(0.35)
     return True
 
 
 def _measure_slider_points(cdp) -> tuple[float, float, float, float] | None:
-    """Open geo page briefly, map handle → track end onto the iframe on CanLII."""
+    """Map slider handle → track end in screen coordinates (iframe-aware)."""
     iframe_gui = cdp.get_gui_element_rect(IFRAME_SEL, timeout=2)
     captcha_url = cdp.get_attribute(IFRAME_SEL, "src")
     if not captcha_url:
         return None
 
     tab = cdp.get_active_tab()
-    x1 = y1 = x2 = y2 = 0.0
     try:
         cdp.open_new_tab(url=captcha_url)
         time.sleep(0.45)
         cdp.loop.run_until_complete(cdp.page.wait(0.15))
 
         for _ in range(24):
-            tab_src = cdp.get_page_source() or ""
-            if browser_harvest.page_ip_blocked_html(tab_src):
-                return None
             if cdp.is_element_present(SLIDER_SEL) and cdp.is_element_present(TARGET_SEL):
                 break
             time.sleep(0.12)

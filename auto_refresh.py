@@ -57,8 +57,9 @@ def wait_ip_cooldown(*, quiet: bool = False) -> None:
 
 
 def _handle_ip_block(*, quiet: bool = False) -> None:
-    """Log IP hard block. Tor rotation is done by harvest_cookie / parallel_scraper."""
     mark_ip_blocked(quiet=quiet)
+    if tor_util.enabled():
+        tor_util.request_new_identity(quiet=quiet)
 
 
 def _run_as(script: str, *, quiet: bool = False) -> str:
@@ -317,9 +318,6 @@ def _try_sb_mint(*, quiet: bool = False) -> str:
     except browser_harvest.HarvestConnectivityError:
         if not quiet:
             print("[harvest] Bad exit — will rotate and retry.\n", flush=True)
-    except browser_harvest.HarvestIpBlockedError:
-        if not quiet:
-            print("[harvest] IP blocked — will rotate and retry.\n", flush=True)
     except Exception as e:
         if not quiet:
             print(f"[auto_refresh] Auto-solve failed ({e}).", file=sys.stderr, flush=True)
@@ -335,10 +333,6 @@ def _harvest_via_selenium(*, try_auto: bool, quiet: bool) -> str:
     except browser_harvest.HarvestConnectivityError:
         if not quiet:
             print("[harvest] Bad exit — will rotate and retry.\n", flush=True)
-        return ""
-    except browser_harvest.HarvestIpBlockedError:
-        if not quiet:
-            print("[harvest] IP blocked — will rotate and retry.\n", flush=True)
         return ""
     if "datadome=" in cookie:
         LAST_UA = ua
