@@ -77,7 +77,7 @@ def _mint() -> tuple[str, str]:
                     import slider_auto
 
                     slider_auto.try_solve_datadome_slider(
-                        sb, quiet=False, overshoot=8.0 + auto_attempts * 5,
+                        sb, quiet=False, overshoot=15.0 + auto_attempts * 12,
                     )
                 if not prompt_shown:
                     prompt_shown = True

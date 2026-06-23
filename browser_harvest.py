@@ -275,7 +275,9 @@ def harvest_cookie_interactive(
                 if try_auto_solve and slider:
                     import slider_auto
 
-                    slider_auto.try_solve_datadome_slider(sb, quiet=quiet)
+                    slider_auto.try_solve_datadome_slider(
+                        sb, quiet=quiet, overshoot=15.0,
+                    )
                 elif native:
                     import captcha_auto
 

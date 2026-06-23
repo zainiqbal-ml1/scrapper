@@ -1,4 +1,4 @@
-"""DataDome slider auto-drag with correct iframe mapping and full travel."""
+"""DataDome slider auto-drag with iframe-aware coordinates and full track travel."""
 from __future__ import annotations
 
 import time
@@ -10,10 +10,12 @@ SLIDER_SEL = "div.slider"
 TARGET_SEL = "div.sliderTarget"
 
 
-def try_solve_datadome_slider(sb, *, quiet: bool = False, overshoot: float = 10.0) -> bool:
-    """Drag the DataDome slider to the end of the track. Returns True if drag ran."""
+def try_solve_datadome_slider(sb, *, quiet: bool = False, overshoot: float = 18.0) -> bool:
+    """Drag the DataDome slider to the end of the track on the CanLII tab."""
     cdp = sb.cdp if hasattr(sb, "cdp") else sb
     src = cdp.get_page_source() or ""
+    if browser_harvest.page_ip_blocked_html(src):
+        return False
     if not browser_harvest.is_datadome_slider_html(src):
         return False
     if not cdp.is_element_visible(IFRAME_SEL):
@@ -27,32 +29,43 @@ def try_solve_datadome_slider(sb, *, quiet: bool = False, overshoot: float = 10.
 
     x1, y1, x2, y2 = points
     x2 += overshoot
+    dist = x2 - x1
+    if dist < 30:
+        if not quiet:
+            print("[slider] Track too short — retrying.\n", flush=True)
+        return False
+
+    # Slower drag for longer tracks so the handle reaches the end.
+    timeframe = min(2.2, max(1.35, dist / 160.0))
 
     if not quiet:
-        dist = int(x2 - x1)
-        print(f">>> Slider drag ({dist}px)...\n", flush=True)
+        print(f">>> Slider drag ({int(dist)}px, {timeframe:.1f}s)...\n", flush=True)
 
     cdp.bring_active_window_to_front()
-    time.sleep(0.08)
-    cdp.gui_drag_drop_points(x1, y1, x2, y2, timeframe=1.15)
-    time.sleep(0.35)
+    time.sleep(0.1)
+    cdp.gui_drag_drop_points(x1, y1, x2, y2, timeframe=timeframe)
+    time.sleep(0.55)
     return True
 
 
 def _measure_slider_points(cdp) -> tuple[float, float, float, float] | None:
-    """Map slider handle → track end in screen coordinates (iframe-aware)."""
+    """Open geo page briefly, map handle → track end onto the iframe on CanLII."""
     iframe_gui = cdp.get_gui_element_rect(IFRAME_SEL, timeout=2)
     captcha_url = cdp.get_attribute(IFRAME_SEL, "src")
     if not captcha_url:
         return None
 
     tab = cdp.get_active_tab()
+    x1 = y1 = x2 = y2 = 0.0
     try:
         cdp.open_new_tab(url=captcha_url)
         time.sleep(0.45)
         cdp.loop.run_until_complete(cdp.page.wait(0.15))
 
         for _ in range(24):
+            tab_src = cdp.get_page_source() or ""
+            if browser_harvest.page_ip_blocked_html(tab_src):
+                return None
             if cdp.is_element_present(SLIDER_SEL) and cdp.is_element_present(TARGET_SEL):
                 break
             time.sleep(0.12)
@@ -68,7 +81,12 @@ def _measure_slider_points(cdp) -> tuple[float, float, float, float] | None:
 
         rel_x1 = slider["x"] + slider["width"] / 2.0
         rel_y = slider["y"] + slider["height"] / 2.0
-        rel_x2 = target["x"] + target["width"] - 2.0
+        # Full track: handle center → right edge of target track (+ small inset).
+        track_right = max(
+            target["x"] + target["width"],
+            slider["x"] + slider["width"] + target["width"] * 0.85,
+        )
+        rel_x2 = track_right - 1.0
 
         scale_x = iframe_gui["width"] / captcha_w
         scale_y = iframe_gui["height"] / captcha_h
