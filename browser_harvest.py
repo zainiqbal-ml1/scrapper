@@ -38,6 +38,10 @@ class HarvestConnectivityError(RuntimeError):
     """Tor exit or browser cannot load CanLII — rotate and retry."""
 
 
+class HarvestIpBlockedError(RuntimeError):
+    """DataDome hard IP block — stop harvest and rotate exit (no slider/captcha)."""
+
+
 def page_connectivity_error(src: str, url: str = "") -> bool:
     """True when the page shows a network/proxy failure (not a captcha)."""
     low = (src or "").lower()
@@ -66,6 +70,8 @@ class HarvestStallTracker:
         challenged: bool,
         cdp_ok: bool,
     ) -> str | None:
+        if page_ip_blocked_html(src):
+            return "ip_blocked"
         if page_connectivity_error(src, url):
             return "connectivity_error"
         if not cdp_ok:
@@ -118,11 +124,15 @@ def parse_poll(raw: str) -> tuple[str, bool, bool, bool]:
 
 
 def page_challenged_html(src: str) -> bool:
+    if page_ip_blocked_html(src):
+        return False
     return is_datadome_slider_html(src) or is_canlii_native_captcha_html(src)
 
 
 def is_datadome_slider_html(src: str) -> bool:
     """DataDome slider interstitial (auto-solvable with PyAutoGUI)."""
+    if page_ip_blocked_html(src):
+        return False
     low = (src or "").lower()
     if "captcha-delivery" in low or "geo.captcha-delivery.com" in low:
         return True
@@ -240,13 +250,18 @@ def harvest_cookie_interactive(
                 cdp_ok = False
 
             if page_ip_blocked_html(src):
-                _handle_ip_block_from_harvest(quiet=quiet)
-                break
+                if not quiet:
+                    print(">>> Access temporarily blocked — rotating exit.\n", flush=True)
+                raise HarvestIpBlockedError("ip_blocked")
 
             stall_reason = stall.check(
                 src=src, url=url, cookie=cookie, challenged=challenged, cdp_ok=cdp_ok,
             )
             if stall_reason:
+                if stall_reason == "ip_blocked":
+                    if not quiet:
+                        print(">>> Access temporarily blocked — rotating exit.\n", flush=True)
+                    raise HarvestIpBlockedError(stall_reason)
                 if not quiet:
                     print(f">>> Harvest stalled ({stall_reason}) — trying another exit.\n", flush=True)
                 raise HarvestConnectivityError(stall_reason)

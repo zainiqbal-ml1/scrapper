@@ -65,8 +65,15 @@ def _mint() -> tuple[str, str]:
                 src=src, url=url, cookie=cookie, challenged=challenged, cdp_ok=cdp_ok,
             )
             if stall_reason:
+                if stall_reason == "ip_blocked":
+                    print(">>> Access temporarily blocked — rotating exit.\n", flush=True)
+                    raise browser_harvest.HarvestIpBlockedError(stall_reason)
                 print(f">>> Harvest stalled ({stall_reason}) — trying another exit.\n", flush=True)
                 raise browser_harvest.HarvestConnectivityError(stall_reason)
+
+            if browser_harvest.page_ip_blocked_html(src):
+                print(">>> Access temporarily blocked — rotating exit.\n", flush=True)
+                raise browser_harvest.HarvestIpBlockedError("ip_blocked")
 
             if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
                 break

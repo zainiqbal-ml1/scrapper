@@ -14,6 +14,8 @@ def try_solve_datadome_slider(sb, *, quiet: bool = False, overshoot: float = 10.
     """Drag the DataDome slider to the end of the track. Returns True if drag ran."""
     cdp = sb.cdp if hasattr(sb, "cdp") else sb
     src = cdp.get_page_source() or ""
+    if browser_harvest.page_ip_blocked_html(src):
+        return False
     if not browser_harvest.is_datadome_slider_html(src):
         return False
     if not cdp.is_element_visible(IFRAME_SEL):
@@ -51,6 +53,10 @@ def _measure_slider_points(cdp) -> tuple[float, float, float, float] | None:
         cdp.open_new_tab(url=captcha_url)
         time.sleep(0.45)
         cdp.loop.run_until_complete(cdp.page.wait(0.15))
+
+        tab_src = cdp.get_page_source() or ""
+        if browser_harvest.page_ip_blocked_html(tab_src):
+            return None
 
         for _ in range(24):
             if cdp.is_element_present(SLIDER_SEL) and cdp.is_element_present(TARGET_SEL):
