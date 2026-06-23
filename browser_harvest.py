@@ -222,6 +222,7 @@ def harvest_cookie_interactive(
     cookie = ""
     ua = ""
     prompt_shown = False
+    slider_next_at = 0.0
     tracker = StablePassTracker()
     stall = HarvestStallTracker()
     if not quiet:
@@ -290,7 +291,10 @@ def harvest_cookie_interactive(
                 if try_auto_solve and slider:
                     import slider_auto
 
-                    slider_auto.try_solve_datadome_slider(sb, quiet=quiet)
+                    now = time.monotonic()
+                    if now >= slider_next_at and slider_auto.try_solve_datadome_slider(sb, quiet=quiet):
+                        slider_next_at = time.monotonic() + slider_auto.SOLVE_COOLDOWN_SEC
+                        time.sleep(1.0)
                 elif native:
                     import captcha_auto
 
