@@ -74,11 +74,10 @@ def _mint() -> tuple[str, str]:
             if browser_harvest.is_datadome_slider_html(src):
                 if auto_attempts < SOLVE_ATTEMPTS:
                     auto_attempts += 1
-                    import slider_auto
-
-                    slider_auto.try_solve_datadome_slider(
-                        sb, quiet=False, overshoot=15.0 + auto_attempts * 12,
-                    )
+                    try:
+                        sb.cdp.solve_captcha()
+                    except Exception as e:
+                        print(f"[sb_mint] auto-solve attempt {auto_attempts}: {e}", file=sys.stderr)
                 if not prompt_shown:
                     prompt_shown = True
                     print(">>> Slider detected — dragging...\n", flush=True)
