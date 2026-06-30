@@ -186,9 +186,14 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
                 _handle_ip_block(quiet=quiet)
                 break
             page_ok = poll_passed or browser_harvest.cookie_ready(cookie, challenged=False)
+            src_hint = (
+                "canlii.org ontario database jurisdiction"
+                if poll_passed
+                else ("captcha-delivery" if challenged else "")
+            )
 
             stall_reason = stall.check(
-                src=raw, url="", cookie=cookie, challenged=challenged, cdp_ok=bool(raw.strip()),
+                src=src_hint, url="", cookie=cookie, challenged=challenged, cdp_ok=bool(raw.strip()),
             )
             if stall_reason:
                 if not quiet:
@@ -196,7 +201,7 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
                 _run_as(AS_CLOSE % win_idx, quiet=True)
                 break
 
-            if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
+            if tracker.update(cookie=cookie, challenged=challenged, src=src_hint):
                 passed = True
                 break
 
@@ -217,6 +222,10 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
         if passed or not tracker.captcha_seen:
             _run_as(AS_CLOSE % win_idx, quiet=True)
 
+    if passed and cookie and "datadome=" in cookie:
+        cookie = browser_harvest.finalize_harvest(
+            cookie, "canlii.org ontario database jurisdiction",
+        )
     if passed and cookie and "datadome=" in cookie:
         if not quiet:
             print(">>> Cookie captured — window closed.\n", flush=True)
@@ -356,6 +365,24 @@ def _try_auto_slider_first(*, quiet: bool = False) -> str:
     return ""
 
 
+def _accept_cookie(cookie: str, ua: str, *, juris: str = "on") -> str:
+    """Persist cookie and confirm it loads CanLII before accepting."""
+    if "datadome=" not in cookie:
+        return ""
+    update_session_cookie(cookie, ua)
+    import importlib
+
+    import canlii_scraper as cs
+    import session
+
+    importlib.reload(session)
+    cs.HEADERS = session.HEADERS
+    if cs.check_session(juris):
+        return cookie
+    print(">>> Session check failed — retrying harvest...\n", flush=True)
+    return ""
+
+
 def harvest_cookie() -> str:
     """Harvest a validated cookie — auto slider first when permitted."""
     global LAST_UA
@@ -372,15 +399,21 @@ def harvest_cookie() -> str:
                 print("Tor on — routing cookie harvest through Tor (SeleniumBase).\n", flush=True)
 
             cookie = _try_sb_mint(quiet=False)
-            if "datadome=" in cookie:
+            if cookie:
+                cookie = _accept_cookie(cookie, LAST_UA)
+            if cookie:
                 return cookie
             cookie = _harvest_via_selenium(try_auto=True, quiet=False)
-            if "datadome=" in cookie:
+            if cookie:
+                cookie = _accept_cookie(cookie, LAST_UA)
+            if cookie:
                 return cookie
             continue
 
         cookie = _try_auto_slider_first(quiet=False)
-        if "datadome=" in cookie:
+        if cookie:
+            cookie = _accept_cookie(cookie, LAST_UA)
+        if cookie:
             return cookie
         break
 

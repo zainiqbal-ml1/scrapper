@@ -13,7 +13,6 @@ import tor_util
 SESSION_FILE = Path("session.py")
 COOKIE_STATE = Path(".cookie_state.json")
 START_URL = browser_harvest.START_URL
-SOLVE_ATTEMPTS = 6
 
 LAST_UA = ""
 
@@ -21,81 +20,10 @@ LAST_UA = ""
 def _mint() -> tuple[str, str]:
     from seleniumbase import SB
 
-    cookie = ""
-    ua = ""
-    prompt_shown = False
-    auto_attempts = 0
-    tracker = browser_harvest.StablePassTracker()
-    stall = browser_harvest.HarvestStallTracker()
-
     with SB(uc=True, headed=True, locale="en", **tor_util.sb_proxy_kw()) as sb:
         sb.activate_cdp_mode(START_URL)
         print("\n>>> DataDome slider — auto-solving (SeleniumBase + mouse)...\n", flush=True)
-
-        def read_state() -> tuple[str, str, bool, bool, str, str, bool]:
-            cdp_ok = True
-            url = ""
-            try:
-                src = sb.cdp.get_page_source() or ""
-            except Exception:
-                src = ""
-                cdp_ok = False
-            try:
-                url = sb.cdp.evaluate("location.href") or ""
-            except Exception:
-                cdp_ok = False
-            try:
-                c = sb.cdp.evaluate("document.cookie") or ""
-            except Exception:
-                c = ""
-                cdp_ok = False
-            try:
-                u = sb.cdp.evaluate("navigator.userAgent") or ""
-            except Exception:
-                u = ""
-                cdp_ok = False
-            ch = browser_harvest.page_challenged_html(src)
-            ok = browser_harvest.page_passed_html(src)
-            return c, u, ch, ok, src, url, cdp_ok
-
-        while True:
-            cookie, ua, challenged, page_ok, src, url, cdp_ok = read_state()
-
-            stall_reason = stall.check(
-                src=src, url=url, cookie=cookie, challenged=challenged, cdp_ok=cdp_ok,
-            )
-            if stall_reason:
-                print(f">>> Harvest stalled ({stall_reason}) — trying another exit.\n", flush=True)
-                raise browser_harvest.HarvestConnectivityError(stall_reason)
-
-            if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
-                break
-
-            if browser_harvest.is_datadome_slider_html(src):
-                if auto_attempts < SOLVE_ATTEMPTS:
-                    auto_attempts += 1
-                    try:
-                        sb.cdp.solve_captcha()
-                    except Exception as e:
-                        print(f"[sb_mint] auto-solve attempt {auto_attempts}: {e}", file=sys.stderr)
-                if not prompt_shown:
-                    prompt_shown = True
-                    print(">>> Slider detected — dragging...\n", flush=True)
-            elif browser_harvest.is_canlii_native_captcha_html(src):
-                if not prompt_shown:
-                    prompt_shown = True
-                    print("\n>>> CanLII captcha — auto-solving (checkbox + OCR)...\n", flush=True)
-                elif tracker.should_print_second_hint():
-                    print(">>> Second captcha — trying again...\n", flush=True)
-                import captcha_auto
-
-                captcha_auto.try_solve(sb, quiet=False)
-
-            sb.sleep(
-                2.0 if tracker.captcha_seen else browser_harvest.POLL_INTERVAL
-            )
-
-    return cookie.strip(), ua.strip()
+        return browser_harvest.run_harvest_loop(sb, try_auto_solve=True, quiet=False)
 
 
 def harvest_cookie() -> str:

@@ -128,17 +128,21 @@ def harvest_linux_fast(*, quiet: bool = True) -> tuple[str, str]:
                 url = driver.current_url or ""
             except Exception:
                 url = ""
+            page_ok = page_ok or cookie_ready(cookie, challenged=False)
+            src_hint = (
+                "canlii.org ontario database jurisdiction"
+                if page_ok and not challenged
+                else src
+            )
             stall_reason = stall.check(
-                src=src, url=url, cookie=cookie, challenged=challenged, cdp_ok=True,
+                src=src_hint, url=url, cookie=cookie, challenged=challenged, cdp_ok=True,
             )
             if stall_reason:
                 if not quiet:
                     print(f">>> Harvest stalled ({stall_reason}).\n", flush=True)
                 raise HarvestConnectivityError(stall_reason)
 
-            page_ok = page_ok or cookie_ready(cookie, challenged=False)
-
-            if tracker.update(cookie=cookie, challenged=challenged, page_ok=page_ok):
+            if tracker.update(cookie=cookie, challenged=challenged, src=src_hint):
                 passed = True
                 break
 
