@@ -8,7 +8,7 @@ skipped).
 
 Run it in your OWN terminal (it needs to read your keypresses).
 
-Interactive (recommended) - pick state, db(s), years, rate, Tor:
+Interactive (recommended) - pick state, db(s), years, rate, Tor, good-exit threshold:
     python run.py
 
 Non-interactive (pass everything):
@@ -118,11 +118,12 @@ def select_rate() -> str:
     return raw or f"{dr:g}"
 
 
-def select_good_exit_threshold() -> int:
+def select_good_exit_threshold(*, use_tor: bool) -> int:
     """Ask how many PDFs per cookie before reusing the same Tor exit."""
     default = tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD
+    hint = "" if use_tor else " (only used with Tor)"
     raw = input(
-        f"Tor: reuse exit after this many PDFs per cookie [{default}]: ",
+        f"Reuse Tor exit after this many PDFs per cookie [{default}]{hint}: ",
     ).strip()
     if not raw:
         return default
@@ -151,7 +152,7 @@ def _tor_from_flags(args: list[str]) -> bool | None:
 
 
 def interactive_select(*, tor_default: bool | None = None):
-    """Prompt for jurisdiction -> db(s) -> years -> rate -> Tor.
+    """Prompt for jurisdiction -> db(s) -> years -> rate -> good-exit -> Tor.
 
     Returns (juris, db_list, years, rate, use_tor, good_exit_threshold).
     """
@@ -169,14 +170,14 @@ def interactive_select(*, tor_default: bool | None = None):
     if juris == "all":
         years = cs.select_years()
         rate = select_rate()
-        good_exit = select_good_exit_threshold() if use_tor else tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD
+        good_exit = select_good_exit_threshold(use_tor=use_tor)
         print("\nAll jurisdictions selected -> every database.")
         return "all", ["all"], years, rate, use_tor, good_exit
     dbs = _discover_dbs_with_refresh(juris)
     chosen = cs.select_databases(dbs)
     years = cs.select_years()
     rate = select_rate()
-    good_exit = select_good_exit_threshold() if use_tor else tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD
+    good_exit = select_good_exit_threshold(use_tor=use_tor)
     return juris, chosen, years, rate, use_tor, good_exit
 
 
@@ -272,8 +273,8 @@ def main() -> int:
             db_list.append(tok)
 
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
-          f"rate={rate} req/s"
-          f"{f' good-exit={good_exit}+ PDFs' if use_tor else ''} "
+          f"rate={rate} req/s good-exit={good_exit}+ PDFs"
+          f"{' (Tor)' if use_tor else ''} "
           f"| OS: {platform_util.system()} "
           f"| harvest: {platform_util.harvest_backend()}\n"
           f"Restart on temporary block: delay={restart_delay:g}s "
