@@ -391,7 +391,10 @@ def harvest_cookie() -> str:
 
     for attempt in range(max_tries):
         if tor_util.enabled():
-            tor_util.rotate_for_new_cookie()
+            if attempt == 0:
+                tor_util.prepare_cookie_refresh()
+            else:
+                tor_util.rotate_for_new_cookie()
             if not tor_util.can_reach_canlii():
                 print("[tor] Exit cannot reach CanLII — trying another...\n", flush=True)
                 continue

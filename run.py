@@ -15,7 +15,7 @@ Non-interactive (pass everything):
     python run.py --juris on --db all --years all
     python run.py --juris on --db onca onsc --years 2020-2024 --rate 3
     python run.py --juris on --db onca --years 2024 --rate 0.1-0.2
-    python run.py --tor --juris on --db onca --years 2024 --rate 0.1-0.2
+    python run.py --tor --juris on --db onca --years 2024 --rate 0.1-0.2 --good-exit-threshold 10
     python run.py --juris all --db all --years all
 """
 import subprocess
@@ -118,6 +118,21 @@ def select_rate() -> str:
     return raw or f"{dr:g}"
 
 
+def select_good_exit_threshold() -> int:
+    """Ask how many PDFs per cookie before reusing the same Tor exit."""
+    default = tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD
+    raw = input(
+        f"Tor: reuse exit after this many PDFs per cookie [{default}]: ",
+    ).strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        print(f"Invalid number — using {default}.", flush=True)
+        return default
+
+
 def select_tor(*, default: bool | None = None) -> bool:
     """Ask whether to route CanLII traffic through local Tor."""
     if default is not None:
@@ -138,7 +153,7 @@ def _tor_from_flags(args: list[str]) -> bool | None:
 def interactive_select(*, tor_default: bool | None = None):
     """Prompt for jurisdiction -> db(s) -> years -> rate -> Tor.
 
-    Returns (juris, db_list, years, rate, use_tor).
+    Returns (juris, db_list, years, rate, use_tor, good_exit_threshold).
     """
     juris = cs.select_jurisdiction()
     print(flush=True)  # newline after selection so status line is visible
@@ -154,13 +169,15 @@ def interactive_select(*, tor_default: bool | None = None):
     if juris == "all":
         years = cs.select_years()
         rate = select_rate()
+        good_exit = select_good_exit_threshold() if use_tor else tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD
         print("\nAll jurisdictions selected -> every database.")
-        return "all", ["all"], years, rate, use_tor
+        return "all", ["all"], years, rate, use_tor, good_exit
     dbs = _discover_dbs_with_refresh(juris)
     chosen = cs.select_databases(dbs)
     years = cs.select_years()
     rate = select_rate()
-    return juris, chosen, years, rate, use_tor
+    good_exit = select_good_exit_threshold() if use_tor else tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD
+    return juris, chosen, years, rate, use_tor, good_exit
 
 
 def run_scrape(
@@ -172,10 +189,12 @@ def run_scrape(
     restart_delay: float = DEFAULT_RESTART_DELAY,
     max_restarts: int = DEFAULT_MAX_RESTARTS,
     use_tor: bool = False,
+    good_exit_threshold: int = tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD,
 ) -> int:
     """Single-worker scrape with a request/sec cap; resume same settings on hard block."""
     cmd = [sys.executable, "parallel_scraper.py", "--juris", juris, "--db", *db_list,
-           "--years", years, "--workers", "1", "--rate", str(rate)]
+           "--years", years, "--workers", "1", "--rate", str(rate),
+           "--good-exit-threshold", str(good_exit_threshold)]
     if use_tor:
         cmd.append("--tor")
     restarts = 0
@@ -219,7 +238,7 @@ def main() -> int:
 
     if not args:
         try:
-            juris, db_list, years, rate, use_tor = interactive_select(tor_default=tor_flag)
+            juris, db_list, years, rate, use_tor, good_exit = interactive_select(tor_default=tor_flag)
         except (KeyboardInterrupt, EOFError):
             print("\nCancelled.")
             return 130
@@ -237,6 +256,9 @@ def main() -> int:
         juris = _extract_opt(args, "--juris", str, "on")
         years = _extract_opt(args, "--years", str, "all")
         rate = _extract_opt(args, "--rate", str, f"{platform_util.default_rate():g}")
+        good_exit = _extract_opt(
+            args, "--good-exit-threshold", int, tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD,
+        )
         restart_delay = _extract_opt(args, "--restart-delay", float, DEFAULT_RESTART_DELAY)
         max_restarts = _extract_opt(args, "--max-restarts", int, DEFAULT_MAX_RESTARTS)
         if "--db" not in args:
@@ -250,7 +272,9 @@ def main() -> int:
             db_list.append(tok)
 
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
-          f"rate={rate} req/s | OS: {platform_util.system()} "
+          f"rate={rate} req/s"
+          f"{f' good-exit={good_exit}+ PDFs' if use_tor else ''} "
+          f"| OS: {platform_util.system()} "
           f"| harvest: {platform_util.harvest_backend()}\n"
           f"Restart on temporary block: delay={restart_delay:g}s "
           f"max={max_restarts if max_restarts > 0 else 'unlimited'}\n")
@@ -273,6 +297,7 @@ def main() -> int:
         restart_delay=restart_delay,
         max_restarts=max_restarts,
         use_tor=use_tor,
+        good_exit_threshold=good_exit,
     )
 
 

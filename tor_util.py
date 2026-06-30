@@ -11,12 +11,26 @@ _ENABLED = False
 _CONTROL_PORT = 9051
 _ip: str | None = None
 _last_cookie_ip: str | None = None
+_keep_same_exit = False
+_last_burn_downloads = 0
+DEFAULT_GOOD_EXIT_PDF_THRESHOLD = 10
+GOOD_EXIT_PDF_THRESHOLD = DEFAULT_GOOD_EXIT_PDF_THRESHOLD
 _MAX_ROTATE_ATTEMPTS = 6
 _NEWNYM_WAIT_SEC = 11.0  # Tor rate-limits NEWNYM to ~1 per 10s
 
 
 def enabled() -> bool:
     return _ENABLED
+
+
+def set_good_exit_threshold(n: int) -> None:
+    """Minimum PDFs per cookie before reusing the same Tor exit on refresh."""
+    global GOOD_EXIT_PDF_THRESHOLD
+    GOOD_EXIT_PDF_THRESHOLD = max(1, int(n))
+
+
+def good_exit_threshold() -> int:
+    return GOOD_EXIT_PDF_THRESHOLD
 
 
 def socks_url() -> str | None:
@@ -95,6 +109,11 @@ def invalidate_ip() -> None:
     _ip = None
 
 
+def _clear_keep_exit() -> None:
+    global _keep_same_exit
+    _keep_same_exit = False
+
+
 def public_ip(*, force: bool = False) -> str:
     """Cached public IP; refetch only after invalidate_ip() or force=True."""
     global _ip
@@ -167,6 +186,7 @@ def request_new_identity(*, wait_sec: float = 5.0, quiet: bool = False) -> bool:
             controller.signal(Signal.NEWNYM)
         time.sleep(wait_sec)
         invalidate_ip()
+        _clear_keep_exit()
         if not quiet:
             new = public_ip(force=True)
             print(f"[tor] NEWNYM — exit now {new}\n", flush=True)
@@ -187,6 +207,7 @@ def request_new_identity(*, wait_sec: float = 5.0, quiet: bool = False) -> bool:
             sock.recv(256)
         time.sleep(wait_sec)
         invalidate_ip()
+        _clear_keep_exit()
         if not quiet:
             new = public_ip(force=True)
             print(f"[tor] NEWNYM — exit now {new}\n", flush=True)
@@ -202,6 +223,42 @@ def mark_cookie_ip() -> str:
     global _last_cookie_ip
     _last_cookie_ip = public_ip(force=True)
     return _last_cookie_ip
+
+
+def note_cookie_burn(downloads_since_cookie: int) -> None:
+    """Record PDF yield before cookie burn; keep IP if exit was productive."""
+    global _keep_same_exit, _last_burn_downloads
+    _last_burn_downloads = max(0, downloads_since_cookie)
+    _keep_same_exit = _last_burn_downloads >= GOOD_EXIT_PDF_THRESHOLD
+    if not enabled():
+        return
+    ip = public_ip()
+    if _keep_same_exit:
+        print(
+            f"[tor] Good exit {ip} ({_last_burn_downloads} PDFs) — "
+            f"reusing IP for new cookie.",
+            flush=True,
+        )
+    else:
+        print(
+            f"[tor] Weak exit {ip} ({_last_burn_downloads} PDFs, "
+            f"need {GOOD_EXIT_PDF_THRESHOLD}+) — rotating IP.",
+            flush=True,
+        )
+
+
+def prepare_cookie_refresh(*, quiet: bool = False, force_rotate: bool = False) -> bool:
+    """Rotate Tor exit only when the last cookie burned too quickly."""
+    if not enabled():
+        return False
+    if not force_rotate and _keep_same_exit:
+        if not quiet:
+            print(
+                f"[tor] Keeping good exit {public_ip()} — harvesting new cookie only.\n",
+                flush=True,
+            )
+        return False
+    return rotate_for_new_cookie(quiet=quiet)
 
 
 def rotate_for_new_cookie(*, quiet: bool = False) -> bool:

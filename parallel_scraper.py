@@ -219,6 +219,8 @@ def get_session(sessions: SessionCookies, force_new: bool = False) -> requests.S
 
     if force_new and current_cookie:
         print("    (cookie swap — blocked)", flush=True)
+        if tor_util.enabled():
+            tor_util.note_cookie_burn(getattr(_local, "downloads_on_cookie", 0))
 
     cookie = sessions.acquire_for_swap(current_cookie) if force_new else COOKIE
 
@@ -229,6 +231,7 @@ def get_session(sessions: SessionCookies, force_new: bool = False) -> requests.S
         timeout=60,
     )
     _local.cookie = cookie
+    _local.downloads_on_cookie = 0
     if force_new and tor_util.enabled():
         print(f"    ({tor_util.ip_label()})", flush=True)
     return _local.session
@@ -285,6 +288,7 @@ def download_task(
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(r.content)
             task.pop("_fail_msg", None)
+            _local.downloads_on_cookie = getattr(_local, "downloads_on_cookie", 0) + 1
             return task, True, f"{len(r.content)//1024} KB"
         except NeedNewCookie:
             get_session(sessions, force_new=True)
@@ -544,6 +548,9 @@ def main() -> int:
                     help="Concurrent download workers (default 1; rate is the real ceiling)")
     ap.add_argument("--rate", default=f"{platform_util.default_rate():g}",
                     help="Requests/sec, or a range like 0.1-0.2")
+    ap.add_argument("--good-exit-threshold", type=int,
+                    default=tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD,
+                    help="Tor: reuse exit IP when cookie burned after this many PDFs (default: 10)")
     ap.add_argument("--no-backup-cookie", action="store_true",
                     help="Disable the single background backup cookie harvest")
     ap.add_argument("--tor", action="store_true",
@@ -556,6 +563,8 @@ def main() -> int:
         except RuntimeError as e:
             print(f"Tor error: {e}", file=sys.stderr)
             return 1
+
+    tor_util.set_good_exit_threshold(args.good_exit_threshold)
 
     cs.OUT_ROOT = Path(args.out)
     limiter = RateLimiter(args.rate)
@@ -574,7 +583,8 @@ def main() -> int:
 
     print(f"Scrape: {args.workers} workers, {limiter.label()} req/s "
           f"| backup cookie: {'off' if not backup_enabled else 'one'} "
-          f"| tor: {'on' if tor_on else 'off'} "
+          f"| tor: {'on' if tor_on else 'off'}"
+          f"{f' | good-exit: {tor_util.good_exit_threshold()}+ PDFs' if tor_on else ''} "
           f"(structure: {cs.OUT_ROOT}/<state>/<db>/<year>/)\n")
     tor_util.print_ip()
     if tor_on:
