@@ -57,6 +57,8 @@ def _reload_session() -> None:
 def refresh_until_valid(juris: str) -> bool:
     """Refresh the session until check_session passes (one window at a time)."""
     print("\nSession blocked — need a fresh cookie.\n", flush=True)
+    if tor_util.enabled():
+        tor_util.set_current_lane(0)
     while True:
         cookie = auto_refresh.harvest_cookie()
         if cookie and "datadome=" in cookie:

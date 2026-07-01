@@ -281,6 +281,7 @@ def print_ip(*, force: bool = True) -> None:
     for ln in _LANES:
         set_current_lane(ln.lane_id)
         print(f"Outbound lane {ln.lane_id}: {ip_label(force=force)}", flush=True)
+    set_current_lane(0)
 
 
 def _exclude_exit_and_newnym(ln: _Lane, exit_ip: str, *, wait_sec: float = 4.0) -> bool:
@@ -404,6 +405,8 @@ def prepare_cookie_refresh(*, quiet: bool = False, force_rotate: bool = False, l
                 f"harvesting new cookie only.\n",
                 flush=True,
             )
+        return False
+    if not force_rotate and ln._last_burn_downloads == 0:
         return False
     return rotate_for_new_cookie(quiet=quiet, lane_id=ln.lane_id)
 

@@ -143,12 +143,35 @@ class SessionCookies:
             return COOKIE, getattr(auto_refresh, "LAST_UA", "") or ""
         raise RuntimeError(f"Lane {lane_id} has no cookie yet")
 
+    def seed_any_lane_from_session(self, juris: str) -> int | None:
+        """Reuse session.py cookie on whichever lane's IP still accepts it."""
+        import session as sess
+
+        cookie = getattr(sess, "COOKIE", "")
+        ua = getattr(sess, "USER_AGENT", "")
+        if "datadome=" not in cookie:
+            return None
+        for lid in range(self.n_lanes):
+            tor_util.set_current_lane(lid)
+            if cs.probe_harvested_session(cookie, ua, juris):
+                self._store_lane(lid, cookie, ua)
+                tor_util.mark_cookie_ip(lane_id=lid)
+                return lid
+        return None
+
     def ensure_lane(self, lane_id: int, *, quiet: bool = False) -> str:
         if lane_id in self._lane_store:
             return self._lane_store[lane_id]["cookie"]
         return self.harvest_fresh(quiet=quiet, juris=self.juris, lane_id=lane_id)
 
-    def harvest_fresh(self, *, quiet: bool = False, juris: str = "on", lane_id: int | None = None) -> str:
+    def harvest_fresh(
+        self,
+        *,
+        quiet: bool = False,
+        juris: str = "on",
+        lane_id: int | None = None,
+        after_burn: bool = False,
+    ) -> str:
         lane_id = lane_id if lane_id is not None else tor_util.current_lane_id()
         with self._harvest_locks[lane_id]:
             tor_util.set_current_lane(lane_id)
@@ -156,7 +179,7 @@ class SessionCookies:
                 tag = f" (lane {lane_id})" if self.n_lanes > 1 else ""
                 print(f"\n>>> Harvesting a fresh cookie{tag}...\n", flush=True)
             for _ in range(self.MAX_HARVEST_RETRIES):
-                cookie = auto_refresh.harvest_cookie(juris=juris)
+                cookie = auto_refresh.harvest_cookie(juris=juris, after_burn=after_burn)
                 ua = getattr(auto_refresh, "LAST_UA", "") or ""
                 if cookie and "datadome=" in cookie:
                     self._store_lane(lane_id, cookie, ua)
@@ -218,7 +241,7 @@ class SessionCookies:
                 print("    (using backup cookie)", flush=True)
                 self.kick_backup()
                 return backup_cookie
-        cookie = self.harvest_fresh(juris=self.juris, lane_id=lane_id)
+        cookie = self.harvest_fresh(juris=self.juris, lane_id=lane_id, after_burn=True)
         if self._backup_enabled:
             self.kick_backup()
         return cookie
@@ -638,9 +661,14 @@ def main() -> int:
     sessions = SessionCookies(backup_enabled=backup_enabled, n_lanes=n_lanes)
 
     if tor_on and n_lanes > 1:
-        print(f"Prefilling {n_lanes} Tor lanes (one cookie harvest per lane)...\n", flush=True)
+        first_juris = jurisdictions[0]
+        sessions.juris = first_juris
+        if matched := sessions.seed_any_lane_from_session(first_juris):
+            print(f"Lane {matched}: reusing validated session cookie (no re-harvest).\n", flush=True)
+        print(f"Prefilling Tor lanes ({n_lanes} total)...\n", flush=True)
         for lid in range(n_lanes):
-            sessions.ensure_lane(lid)
+            if lid not in sessions._lane_store:
+                sessions.ensure_lane(lid)
     elif tor_on and n_lanes == 1:
         tor_util.mark_cookie_ip()
 
