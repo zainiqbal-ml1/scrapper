@@ -14,20 +14,18 @@ START_URL = "https://www.canlii.org/en/on/"
 POLL_INTERVAL = 0.25
 STABLE_POLLS_CLEAR = 4          # ~1s with no captcha on the path
 STABLE_POLLS_AFTER_CAPTCHA = 12  # ~3s stable pass after slider / captcha steps
-POST_SLIDER_GUARD_POLLS = 6      # ~1.5s watch for follow-up captcha after slider
+_SOLVE_COOLDOWN_SEC = 2.0
+_LAST_SOLVE_AT = 0.0
 
-# Live DOM check — catches 2nd captcha before it appears in page_source snapshot.
-FOLLOWUP_JS = (
-    "(()=>{"
+# Checked once when the pass streak completes — not every poll.
+PENDING_CAPTCHA_JS = (
+    "(()=>{try{"
     "const t=(document.body&&document.body.innerText||'').toLowerCase();"
-    "const h=(document.documentElement&&document.documentElement.innerHTML||'').toLowerCase();"
     "const u=location.href.toLowerCase();"
-    "if(u.includes('captcha-delivery')||u.includes('geo.captcha'))return 'delivery';"
-    "if(t.includes('proceed with our captcha')||t.includes('calls upon users accessing'))return 'canlii';"
-    "if(document.querySelector('iframe[src*=\"recaptcha\"],iframe[src*=\"captcha-delivery\"],iframe[title*=\"reCAPTCHA\"]'))return 'iframe';"
-    "if(h.includes('g-recaptcha')||h.includes('google.com/recaptcha'))return 'recaptcha';"
-    "return '';"
-    "})()"
+    "if(u.includes('captcha-delivery')||u.includes('geo.captcha'))return true;"
+    "if(t.includes('proceed with our captcha')||t.includes('calls upon users accessing'))return true;"
+    "return !!document.querySelector('iframe[src*=\"recaptcha\"],iframe[src*=\"captcha-delivery\"]');"
+    "}catch(e){return true;}})()"
 )
 
 # Chrome / proxy failure pages (not time-based — detected from page content).
@@ -80,14 +78,9 @@ class HarvestStallTracker:
         cookie: str,
         challenged: bool,
         cdp_ok: bool,
-        hold: bool = False,
     ) -> str | None:
         if page_connectivity_error(src, url):
             return "connectivity_error"
-        if hold:
-            self.blank_streak = 0
-            self.cdp_fails = 0
-            return None
         if not cdp_ok:
             self.cdp_fails += 1
             if self.cdp_fails >= self.CDP_FAIL_LIMIT:
@@ -170,28 +163,9 @@ def harvest_complete(cookie: str, src: str) -> bool:
     )
 
 
-def harvest_complete_verified(
-    cookie: str, src: str, url: str = "", *, followup: str = "",
-) -> bool:
-    """Stricter pass check — rejects partial pages and pending follow-up captchas."""
-    if followup:
-        return False
-    if not harvest_complete(cookie, src):
-        return False
-    u = (url or "").lower()
-    if "captcha-delivery" in u or "geo.captcha" in u:
-        return False
-    low = (src or "").lower()
-    if "proceed with our captcha" in low or "calls upon users accessing" in low:
-        return False
-    if "g-recaptcha" in low or "google.com/recaptcha" in low:
-        return False
-    return True
-
-
-def finalize_harvest(cookie: str, src: str, url: str = "") -> str:
-    """Return cookie only when the session is fully verified."""
-    return cookie.strip() if harvest_complete_verified(cookie, src, url) else ""
+def finalize_harvest(cookie: str, src: str) -> str:
+    """Return cookie only when harvest_complete; otherwise empty (invalid partial)."""
+    return cookie.strip() if harvest_complete(cookie, src) else ""
 
 
 def is_datadome_slider_html(src: str) -> bool:
@@ -234,54 +208,22 @@ def cookie_ready(cookie: str, *, challenged: bool) -> bool:
 
 
 class StablePassTracker:
-    """Require consecutive verified polls before closing (longer after captcha)."""
+    """Require consecutive complete polls before closing (longer after captcha)."""
 
     def __init__(self) -> None:
         self.captcha_seen = False
         self.streak = 0
         self._second_hint = False
-        self._on_slider = False
-        self._post_slider_guard = 0
 
-    def holding_stall(self) -> bool:
-        """True while waiting for a possible follow-up captcha after the slider."""
-        return self._post_slider_guard > 0
-
-    def update(
-        self,
-        *,
-        cookie: str,
-        challenged: bool,
-        src: str,
-        url: str = "",
-        followup: str = "",
-    ) -> bool:
-        on_slider = is_datadome_slider_html(src)
-        followup_active = bool(followup) or is_canlii_native_captcha_html(src) or is_recaptcha_html(src)
-
-        if on_slider:
-            self._on_slider = True
-        elif self._on_slider and not followup_active and not challenged:
-            if self._post_slider_guard == 0:
-                self._post_slider_guard = POST_SLIDER_GUARD_POLLS
-            self._on_slider = False
-
-        if challenged or followup_active:
-            if self.captcha_seen and not on_slider:
+    def update(self, *, cookie: str, challenged: bool, src: str) -> bool:
+        if challenged or is_recaptcha_html(src):
+            if self.captcha_seen:
                 self._second_hint = True
             self.captcha_seen = True
-            self._post_slider_guard = 0
-            self.streak = 0
-            if on_slider:
-                self._on_slider = True
-            return False
-
-        if self._post_slider_guard > 0:
-            self._post_slider_guard -= 1
             self.streak = 0
             return False
 
-        if not harvest_complete_verified(cookie, src, url):
+        if not harvest_complete(cookie, src):
             self.streak = 0
             return False
 
@@ -300,20 +242,44 @@ class StablePassTracker:
         return self.captcha_seen and not harvest_complete(cookie, src)
 
 
-def _auto_solve_step(sb, *, src: str, try_auto_solve: bool, quiet: bool) -> None:
+def browser_has_pending_captcha(sb) -> bool:
+    """True when a follow-up captcha is still on screen (or browser is unreadable)."""
+    try:
+        return bool(sb.cdp.evaluate(PENDING_CAPTCHA_JS))
+    except Exception:
+        return True
+
+
+def _auto_solve_step(
+    sb,
+    *,
+    src: str,
+    url: str,
+    try_auto_solve: bool,
+    quiet: bool,
+    cdp_ok: bool,
+) -> None:
     """Run the right auto-solver for the current challenge (or follow-up captcha)."""
-    if not try_auto_solve:
+    global _LAST_SOLVE_AT
+    if not try_auto_solve or not cdp_ok:
+        return
+    if page_connectivity_error(src, url):
+        return
+    now = time.monotonic()
+    if now - _LAST_SOLVE_AT < _SOLVE_COOLDOWN_SEC:
         return
     if is_datadome_slider_html(src):
         try:
             sb.cdp.solve_captcha()
+            _LAST_SOLVE_AT = now
         except Exception as e:
             if not quiet:
                 print(f"[harvest] slider: {e}", file=sys.stderr)
     elif is_canlii_native_captcha_html(src) or is_recaptcha_html(src):
         import captcha_auto
 
-        captcha_auto.try_solve(sb, quiet=quiet)
+        if captcha_auto.try_solve(sb, quiet=quiet):
+            _LAST_SOLVE_AT = now
 
 
 def run_harvest_loop(sb, *, try_auto_solve: bool = False, quiet: bool = False) -> tuple[str, str]:
@@ -343,13 +309,7 @@ def run_harvest_loop(sb, *, try_auto_solve: bool = False, quiet: bool = False) -
             cookie = ua = ""
             cdp_ok = False
 
-        followup = ""
-        try:
-            followup = sb.cdp.evaluate(FOLLOWUP_JS) or ""
-        except Exception:
-            pass
-
-        challenged = page_challenged_html(src) or bool(followup)
+        challenged = page_challenged_html(src)
 
         if page_ip_blocked_html(src):
             _handle_ip_block_from_harvest(quiet=quiet)
@@ -357,21 +317,20 @@ def run_harvest_loop(sb, *, try_auto_solve: bool = False, quiet: bool = False) -
 
         stall_reason = stall.check(
             src=src, url=url, cookie=cookie, challenged=challenged, cdp_ok=cdp_ok,
-            hold=challenged or tracker.holding_stall(),
         )
         if stall_reason:
             if not quiet:
                 print(f">>> Harvest stalled ({stall_reason}) — trying another exit.\n", flush=True)
             raise HarvestConnectivityError(stall_reason)
 
-        if tracker.update(
-            cookie=cookie, challenged=challenged, src=src, url=url, followup=followup,
-        ):
-            if harvest_complete_verified(cookie, src, url):
+        if tracker.update(cookie=cookie, challenged=challenged, src=src):
+            pending = tracker.captcha_seen and browser_has_pending_captcha(sb)
+            if not pending and finalize_harvest(cookie, src):
                 break
             tracker.streak = 0
 
-        if challenged or tracker.awaiting_followup(cookie=cookie, src=src) or tracker.holding_stall():
+        can_solve = cdp_ok and not page_connectivity_error(src, url)
+        if can_solve and (challenged or tracker.awaiting_followup(cookie=cookie, src=src)):
             if not prompt_shown:
                 prompt_shown = True
                 if is_datadome_slider_html(src):
@@ -384,11 +343,13 @@ def run_harvest_loop(sb, *, try_auto_solve: bool = False, quiet: bool = False) -
                     print("\n>>> Finishing captcha — waiting for CanLII to load...\n", flush=True)
             elif tracker.should_print_second_hint() and not quiet:
                 print(">>> Second captcha step — solving...\n", flush=True)
-            _auto_solve_step(sb, src=src, try_auto_solve=try_auto_solve, quiet=quiet)
+            _auto_solve_step(
+                sb, src=src, url=url, try_auto_solve=try_auto_solve, quiet=quiet, cdp_ok=cdp_ok,
+            )
 
         time.sleep(POLL_INTERVAL)
 
-    cookie = finalize_harvest(cookie, src, url)
+    cookie = finalize_harvest(cookie, src)
     if cookie and not quiet:
         print(">>> Cookie captured — window closed.\n", flush=True)
     elif not cookie and not quiet:

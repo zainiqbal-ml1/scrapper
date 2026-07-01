@@ -194,7 +194,6 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
 
             stall_reason = stall.check(
                 src=src_hint, url="", cookie=cookie, challenged=challenged, cdp_ok=bool(raw.strip()),
-                hold=challenged or tracker.holding_stall(),
             )
             if stall_reason:
                 if not quiet:
@@ -203,7 +202,7 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
                 break
 
             if tracker.update(cookie=cookie, challenged=challenged, src=src_hint):
-                if browser_harvest.harvest_complete_verified(cookie, src_hint):
+                if browser_harvest.finalize_harvest(cookie, src_hint):
                     passed = True
                     break
                 tracker.streak = 0
@@ -227,7 +226,7 @@ def harvest_cookie_macos(*, quiet: bool = False, timeout_s: float | None = None)
 
     if passed and cookie and "datadome=" in cookie:
         cookie = browser_harvest.finalize_harvest(
-            cookie, "canlii.org ontario database jurisdiction", "",
+            cookie, "canlii.org ontario database jurisdiction",
         )
     if passed and cookie and "datadome=" in cookie:
         if not quiet:
