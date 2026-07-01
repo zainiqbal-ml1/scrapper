@@ -134,6 +134,18 @@ def select_good_exit_threshold(*, use_tor: bool) -> int:
         return default
 
 
+def select_tor_lanes() -> int:
+    """Ask how many parallel Tor exits (each needs its own SOCKS port)."""
+    raw = input("Tor parallel lanes (2 = two IPs + cookies) [2]: ").strip()
+    if not raw:
+        return 2
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        print("Invalid number — using 2 lanes.", flush=True)
+        return 2
+
+
 def select_tor(*, default: bool | None = None) -> bool:
     """Ask whether to route CanLII traffic through local Tor."""
     if default is not None:
@@ -154,31 +166,41 @@ def _tor_from_flags(args: list[str]) -> bool | None:
 def interactive_select(*, tor_default: bool | None = None):
     """Prompt for jurisdiction -> db(s) -> years -> rate -> good-exit -> Tor.
 
-    Returns (juris, db_list, years, rate, use_tor, good_exit_threshold).
+    Returns (juris, db_list, years, rate, use_tor, good_exit_threshold, tor_lanes).
     """
     juris = cs.select_jurisdiction()
     print(flush=True)  # newline after selection so status line is visible
     use_tor = select_tor(default=tor_default)
+    tor_lanes = 1
     if use_tor:
         try:
-            tor_util.configure(use_tor=True)
+            tor_util.configure(use_tor=True, lanes=1)
         except RuntimeError as e:
             print(f"Tor error: {e}", file=sys.stderr)
             print("Continuing without Tor.\n", flush=True)
             use_tor = False
             tor_util.configure(use_tor=False)
+        else:
+            tor_lanes = select_tor_lanes()
+            try:
+                tor_util.configure(use_tor=True, lanes=tor_lanes)
+            except RuntimeError as e:
+                print(f"Tor lanes error: {e}", file=sys.stderr)
+                print("Falling back to 1 lane.\n", flush=True)
+                tor_lanes = 1
+                tor_util.configure(use_tor=True, lanes=1)
     if juris == "all":
         years = cs.select_years()
         rate = select_rate()
         good_exit = select_good_exit_threshold(use_tor=use_tor)
         print("\nAll jurisdictions selected -> every database.")
-        return "all", ["all"], years, rate, use_tor, good_exit
+        return "all", ["all"], years, rate, use_tor, good_exit, tor_lanes
     dbs = _discover_dbs_with_refresh(juris)
     chosen = cs.select_databases(dbs)
     years = cs.select_years()
     rate = select_rate()
     good_exit = select_good_exit_threshold(use_tor=use_tor)
-    return juris, chosen, years, rate, use_tor, good_exit
+    return juris, chosen, years, rate, use_tor, good_exit, tor_lanes
 
 
 def run_scrape(
@@ -191,13 +213,17 @@ def run_scrape(
     max_restarts: int = DEFAULT_MAX_RESTARTS,
     use_tor: bool = False,
     good_exit_threshold: int = tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD,
+    tor_lanes: int = 1,
 ) -> int:
-    """Single-worker scrape with a request/sec cap; resume same settings on hard block."""
+    """Scrape with a request/sec cap; resume same settings on hard block."""
+    workers = tor_lanes if use_tor and tor_lanes > 1 else 1
     cmd = [sys.executable, "parallel_scraper.py", "--juris", juris, "--db", *db_list,
-           "--years", years, "--workers", "1", "--rate", str(rate),
+           "--years", years, "--workers", str(workers), "--rate", str(rate),
            "--good-exit-threshold", str(good_exit_threshold)]
     if use_tor:
         cmd.append("--tor")
+        if tor_lanes > 1:
+            cmd.extend(["--lanes", str(tor_lanes)])
     restarts = 0
     while True:
         rc = subprocess.call(cmd)
@@ -239,7 +265,7 @@ def main() -> int:
 
     if not args:
         try:
-            juris, db_list, years, rate, use_tor, good_exit = interactive_select(tor_default=tor_flag)
+            juris, db_list, years, rate, use_tor, good_exit, tor_lanes = interactive_select(tor_default=tor_flag)
         except (KeyboardInterrupt, EOFError):
             print("\nCancelled.")
             return 130
@@ -247,9 +273,11 @@ def main() -> int:
         max_restarts = DEFAULT_MAX_RESTARTS
     else:
         use_tor = bool(tor_flag)
+        tor_lanes = 1
         if use_tor:
             try:
-                tor_util.configure(use_tor=True)
+                tor_lanes = _extract_opt(args, "--lanes", int, 2)
+                tor_util.configure(use_tor=True, lanes=tor_lanes)
             except RuntimeError as e:
                 print(f"Tor error: {e}", file=sys.stderr)
                 return 1
@@ -274,7 +302,8 @@ def main() -> int:
 
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
           f"rate={rate} req/s good-exit={good_exit}+ PDFs"
-          f"{' (Tor)' if use_tor else ''} "
+          f"{' (Tor)' if use_tor else ''}"
+          f"{f' lanes={tor_lanes}' if use_tor and tor_lanes > 1 else ''} "
           f"| OS: {platform_util.system()} "
           f"| harvest: {platform_util.harvest_backend()}\n"
           f"Restart on temporary block: delay={restart_delay:g}s "
@@ -299,6 +328,7 @@ def main() -> int:
         max_restarts=max_restarts,
         use_tor=use_tor,
         good_exit_threshold=good_exit,
+        tor_lanes=tor_lanes,
     )
 
 

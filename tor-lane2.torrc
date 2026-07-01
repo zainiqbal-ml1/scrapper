@@ -1,0 +1,7 @@
+# Second Tor instance for lane 1 (lane 0 = Tor Browser on 9150 or tor on 9050).
+# Run in a separate terminal:
+#   tor -f tor-lane2.torrc
+SocksPort 9052
+ControlPort 9053
+CookieAuthentication 0
+DataDirectory /tmp/tor-canlii-lane2
