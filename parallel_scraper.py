@@ -115,85 +115,40 @@ class RateLimiter:
 
 
 class SessionCookies:
-    """Per-lane cookies for Tor; optional backup cookie when not on Tor."""
+    """Sequential session plus one background backup cookie."""
 
     MAX_HARVEST_RETRIES = 2
 
-    def __init__(self, *, backup_enabled: bool = True, n_lanes: int = 1) -> None:
-        self.n_lanes = max(1, n_lanes)
-        self._harvest_locks = [threading.Lock() for _ in range(self.n_lanes)]
-        self._lane_store: dict[int, dict[str, str]] = {}
+    def __init__(self, *, backup_enabled: bool = True) -> None:
+        self._harvest_lock = threading.Lock()
         self._backup_lock = threading.Lock()
         self._backup_cookie: str | None = None
         self._backup_thread: threading.Thread | None = None
         self._stop = threading.Event()
-        self._backup_enabled = backup_enabled and self.n_lanes == 1
+        self._backup_enabled = backup_enabled
         self.juris = "on"
-        if self._backup_enabled:
+        if backup_enabled:
             self.kick_backup()
 
-    def _store_lane(self, lane_id: int, cookie: str, ua: str) -> None:
-        self._lane_store[lane_id] = {"cookie": cookie, "ua": ua or ""}
-
-    def cookie_and_ua(self, lane_id: int) -> tuple[str, str]:
-        st = self._lane_store.get(lane_id)
-        if st:
-            return st["cookie"], st.get("ua", "")
-        if self.n_lanes == 1:
-            return COOKIE, getattr(auto_refresh, "LAST_UA", "") or ""
-        raise RuntimeError(f"Lane {lane_id} has no cookie yet")
-
-    def seed_any_lane_from_session(self, juris: str) -> int | None:
-        """Reuse session.py cookie on whichever lane's IP still accepts it."""
-        import session as sess
-
-        cookie = getattr(sess, "COOKIE", "")
-        ua = getattr(sess, "USER_AGENT", "")
-        if "datadome=" not in cookie:
-            return None
-        for lid in range(self.n_lanes):
-            tor_util.set_current_lane(lid)
-            if cs.probe_harvested_session(cookie, ua, juris):
-                self._store_lane(lid, cookie, ua)
-                tor_util.mark_cookie_ip(lane_id=lid)
-                return lid
-        return None
-
-    def ensure_lane(self, lane_id: int, *, quiet: bool = False) -> str:
-        if lane_id in self._lane_store:
-            return self._lane_store[lane_id]["cookie"]
-        return self.harvest_fresh(quiet=quiet, juris=self.juris, lane_id=lane_id)
-
-    def harvest_fresh(
-        self,
-        *,
-        quiet: bool = False,
-        juris: str = "on",
-        lane_id: int | None = None,
-        after_burn: bool = False,
-    ) -> str:
-        lane_id = lane_id if lane_id is not None else tor_util.current_lane_id()
-        with self._harvest_locks[lane_id]:
-            tor_util.set_current_lane(lane_id)
+    def harvest_fresh(self, *, quiet: bool = False, juris: str = "on") -> str:
+        with self._harvest_lock:
             if not quiet:
-                tag = f" (lane {lane_id})" if self.n_lanes > 1 else ""
-                print(f"\n>>> Harvesting a fresh cookie{tag}...\n", flush=True)
+                print("\n>>> Harvesting a fresh cookie...\n", flush=True)
             for _ in range(self.MAX_HARVEST_RETRIES):
-                cookie = auto_refresh.harvest_cookie(juris=juris, after_burn=after_burn)
-                ua = getattr(auto_refresh, "LAST_UA", "") or ""
+                cookie = auto_refresh.harvest_cookie(juris=juris)
                 if cookie and "datadome=" in cookie:
-                    self._store_lane(lane_id, cookie, ua)
-                    if self.n_lanes == 1:
-                        auto_refresh.update_session_cookie(cookie, ua)
-                        _sync_session_from_disk()
+                    auto_refresh.update_session_cookie(
+                        cookie, getattr(auto_refresh, "LAST_UA", "") or "",
+                    )
+                    _sync_session_from_disk()
                     if not quiet:
                         print(">>> Cookie ready.\n", flush=True)
                     if tor_util.enabled():
-                        tor_util.mark_cookie_ip(lane_id=lane_id)
+                        tor_util.mark_cookie_ip()
                         if not quiet:
-                            print(f"    (cookie on {tor_util.ip_label(lane_id=lane_id)})", flush=True)
+                            print(f"    (cookie on {tor_util.ip_label()})", flush=True)
                     else:
-                        tor_util.invalidate_ip(lane_id=lane_id)
+                        tor_util.invalidate_ip()
                     return cookie
             raise RuntimeError("Could not harvest a fresh cookie (captcha not solved in time).")
 
@@ -229,21 +184,17 @@ class SessionCookies:
                 return backup_cookie
         return None
 
-    def acquire_for_swap(self, current: str | None = None, *, lane_id: int | None = None) -> str:
-        lane_id = lane_id if lane_id is not None else tor_util.current_lane_id()
-        tor_util.set_current_lane(lane_id)
-        if self.n_lanes == 1:
+    def acquire_for_swap(self, current: str | None = None) -> str:
+        backup_cookie = self._take_backup(current)
+        if not backup_cookie and self._backup_thread and self._backup_thread.is_alive():
+            self._backup_thread.join()
             backup_cookie = self._take_backup(current)
-            if not backup_cookie and self._backup_thread and self._backup_thread.is_alive():
-                self._backup_thread.join()
-                backup_cookie = self._take_backup(current)
-            if backup_cookie:
-                print("    (using backup cookie)", flush=True)
-                self.kick_backup()
-                return backup_cookie
-        cookie = self.harvest_fresh(juris=self.juris, lane_id=lane_id, after_burn=True)
-        if self._backup_enabled:
+        if backup_cookie:
+            print("    (using backup cookie)", flush=True)
             self.kick_backup()
+            return backup_cookie
+        cookie = self.harvest_fresh(juris=self.juris)
+        self.kick_backup()
         return cookie
 
     def stop(self) -> None:
@@ -253,16 +204,14 @@ class SessionCookies:
 _local = threading.local()
 
 
-def _request_headers(ua: str = "") -> dict:
-    ua = ua or getattr(auto_refresh, "LAST_UA", "") or ""
+def _request_headers() -> dict:
+    ua = getattr(auto_refresh, "LAST_UA", "") or ""
     if ua:
         return cs.headers_for_ua(ua)
     return dict(HEADERS)
 
 
 def get_session(sessions: SessionCookies, force_new: bool = False) -> requests.Session:
-    lane_id = getattr(_local, "lane_id", 0)
-    tor_util.set_current_lane(lane_id)
     current_cookie = getattr(_local, "cookie", None)
 
     if not force_new and getattr(_local, "session", None):
@@ -271,29 +220,20 @@ def get_session(sessions: SessionCookies, force_new: bool = False) -> requests.S
     if force_new and current_cookie:
         print("    (cookie swap — blocked)", flush=True)
         if tor_util.enabled():
-            tor_util.note_cookie_burn(
-                getattr(_local, "downloads_on_cookie", 0), lane_id=lane_id,
-            )
+            tor_util.note_cookie_burn(getattr(_local, "downloads_on_cookie", 0))
 
-    if force_new:
-        cookie = sessions.acquire_for_swap(current_cookie, lane_id=lane_id)
-        ua = sessions._lane_store.get(lane_id, {}).get("ua", "")
-    elif sessions.n_lanes > 1:
-        cookie, ua = sessions.cookie_and_ua(lane_id)
-    else:
-        cookie, ua = COOKIE, getattr(auto_refresh, "LAST_UA", "") or ""
+    cookie = sessions.acquire_for_swap(current_cookie) if force_new else COOKIE
 
     _local.session = requests.Session(
         impersonate=cs.IMPERSONATE,
-        headers=_request_headers(ua),
+        headers=_request_headers(),
         cookies=parse_cookie(cookie),
         timeout=60,
     )
     _local.cookie = cookie
-    _local.ua = ua
     _local.downloads_on_cookie = 0
     if force_new and tor_util.enabled():
-        print(f"    ({tor_util.ip_label(lane_id=lane_id)})", flush=True)
+        print(f"    ({tor_util.ip_label()})", flush=True)
     return _local.session
 
 
@@ -329,8 +269,6 @@ def _permanent_fail(msg: str) -> bool:
 def download_task(
     sessions: SessionCookies, limiter: RateLimiter, task: dict,
 ) -> tuple[dict, bool, str]:
-    _local.lane_id = task.get("_lane", 0)
-    tor_util.set_current_lane(_local.lane_id)
     dest = Path(task["dest"])
     if dest.exists() and dest.stat().st_size > 0:
         return task, True, "exists"
@@ -393,9 +331,6 @@ def _run_downloads(
     total = len(tasks)
     if not total:
         return 0, []
-    if sessions.n_lanes > 1:
-        for i, t in enumerate(tasks):
-            t.setdefault("_lane", i % sessions.n_lanes)
     ok = 0
     failed: list[dict] = []
     done = 0
@@ -621,14 +556,11 @@ def main() -> int:
                     help="Disable the single background backup cookie harvest")
     ap.add_argument("--tor", action="store_true",
                     help="Route downloads and harvest through local Tor (SOCKS 9050/9150)")
-    ap.add_argument("--lanes", type=int, default=1,
-                    help="Tor: parallel exit lanes, each with its own cookie (default 1; use 2 with tor-lane2.torrc)")
     args = ap.parse_args()
 
-    tor_on = args.tor or os.environ.get("CANLII_USE_TOR", "").strip().lower() in {"1", "true", "yes"}
-    if tor_on:
+    if args.tor or os.environ.get("CANLII_USE_TOR", "").strip().lower() in {"1", "true", "yes"}:
         try:
-            tor_util.configure(use_tor=True, lanes=max(1, args.lanes))
+            tor_util.configure(use_tor=True)
         except RuntimeError as e:
             print(f"Tor error: {e}", file=sys.stderr)
             return 1
@@ -641,36 +573,24 @@ def main() -> int:
     jurisdictions = list(cs.JURISDICTIONS.keys()) if args.juris == "all" else [args.juris]
     grand = {"total": 0, "downloaded": 0, "failed": 0}
 
-    n_lanes = tor_util.lane_count() if tor_on else 1
-    workers = args.workers
-    if tor_on and n_lanes > 1:
-        workers = max(workers, n_lanes)
-    backup_enabled = not args.no_backup_cookie and n_lanes == 1
-    if tor_on and not args.no_backup_cookie and n_lanes == 1:
-        pass
-    elif tor_on and not args.no_backup_cookie and n_lanes > 1:
-        print("Backup cookie: auto-disabled with multi-lane Tor.\n", flush=True)
+    tor_on = tor_util.enabled()
+    backup_enabled = not args.no_backup_cookie and not tor_on
+    if tor_on and not args.no_backup_cookie:
+        print(
+            "Backup cookie: auto-disabled with Tor "
+            "(backup would be minted on a different exit IP).\n",
+            flush=True,
+        )
 
-    print(f"Scrape: {workers} workers, {limiter.label()} req/s "
+    print(f"Scrape: {args.workers} workers, {limiter.label()} req/s "
           f"| backup cookie: {'off' if not backup_enabled else 'one'} "
           f"| tor: {'on' if tor_on else 'off'}"
-          f"{f' | lanes: {n_lanes}' if tor_on and n_lanes > 1 else ''}"
           f"{f' | good-exit: {tor_util.good_exit_threshold()}+ PDFs' if tor_on else ''} "
           f"(structure: {cs.OUT_ROOT}/<state>/<db>/<year>/)\n")
     tor_util.print_ip()
-    sessions = SessionCookies(backup_enabled=backup_enabled, n_lanes=n_lanes)
-
-    if tor_on and n_lanes > 1:
-        first_juris = jurisdictions[0]
-        sessions.juris = first_juris
-        if matched := sessions.seed_any_lane_from_session(first_juris):
-            print(f"Lane {matched}: reusing validated session cookie (no re-harvest).\n", flush=True)
-        print(f"Prefilling Tor lanes ({n_lanes} total)...\n", flush=True)
-        for lid in range(n_lanes):
-            if lid not in sessions._lane_store:
-                sessions.ensure_lane(lid)
-    elif tor_on and n_lanes == 1:
+    if tor_on:
         tor_util.mark_cookie_ip()
+    sessions = SessionCookies(backup_enabled=backup_enabled)
 
     try:
         for juris in jurisdictions:

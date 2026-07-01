@@ -385,7 +385,7 @@ def _accept_cookie(cookie: str, ua: str, *, juris: str = "on") -> str:
     return cookie
 
 
-def harvest_cookie(*, juris: str = "on", after_burn: bool = False) -> str:
+def harvest_cookie(*, juris: str = "on") -> str:
     """Harvest a validated cookie — auto slider first when permitted."""
     global LAST_UA
     LAST_UA = ""
@@ -393,9 +393,9 @@ def harvest_cookie(*, juris: str = "on", after_burn: bool = False) -> str:
 
     for attempt in range(max_tries):
         if tor_util.enabled():
-            if after_burn and attempt == 0:
+            if attempt == 0:
                 tor_util.prepare_cookie_refresh()
-            elif attempt > 0 or not tor_util.can_reach_canlii():
+            else:
                 tor_util.rotate_for_new_cookie()
             if not tor_util.can_reach_canlii():
                 print("[tor] Exit cannot reach CanLII — trying another...\n", flush=True)

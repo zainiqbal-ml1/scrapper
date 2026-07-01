@@ -297,8 +297,6 @@ def run_harvest_loop(
     prompt_shown = False
     tracker = StablePassTracker()
     stall = HarvestStallTracker()
-    probe_fails = 0
-    last_probe_msg = 0.0
 
     while True:
         cdp_ok = True
@@ -339,13 +337,12 @@ def run_harvest_loop(
                 if cs.probe_harvested_session(cookie, ua.strip(), juris):
                     break
                 tracker.streak = 0
-                probe_fails += 1
-                now = time.monotonic()
-                if not quiet and now - last_probe_msg >= 3.0:
-                    last_probe_msg = now
-                    print(">>> HTTP probe failed — still solving captcha...\n", flush=True)
-                if probe_fails >= 24:
-                    raise HarvestConnectivityError("session_probe_failed")
+                if not quiet:
+                    print(
+                        ">>> Page looks ready but HTTP session probe failed — "
+                        "waiting for captcha to finish...\n",
+                        flush=True,
+                    )
 
         can_solve = cdp_ok and not page_connectivity_error(src, url)
         if can_solve and (challenged or tracker.awaiting_followup(cookie=cookie, src=src)):
