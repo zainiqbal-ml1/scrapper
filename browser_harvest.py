@@ -282,8 +282,16 @@ def _auto_solve_step(
             _LAST_SOLVE_AT = now
 
 
-def run_harvest_loop(sb, *, try_auto_solve: bool = False, quiet: bool = False) -> tuple[str, str]:
+def run_harvest_loop(
+    sb,
+    *,
+    try_auto_solve: bool = False,
+    quiet: bool = False,
+    juris: str = "on",
+) -> tuple[str, str]:
     """Poll Chrome until harvest is complete, or raise on connectivity failure."""
+    import canlii_scraper as cs
+
     cookie = ""
     ua = ""
     prompt_shown = False
@@ -326,8 +334,15 @@ def run_harvest_loop(sb, *, try_auto_solve: bool = False, quiet: bool = False) -
         if tracker.update(cookie=cookie, challenged=challenged, src=src):
             pending = tracker.captcha_seen and browser_has_pending_captcha(sb)
             if not pending and finalize_harvest(cookie, src):
-                break
-            tracker.streak = 0
+                if cs.probe_harvested_session(cookie, ua.strip(), juris):
+                    break
+                tracker.streak = 0
+                if not quiet:
+                    print(
+                        ">>> Page looks ready but HTTP session probe failed — "
+                        "waiting for captcha to finish...\n",
+                        flush=True,
+                    )
 
         can_solve = cdp_ok and not page_connectivity_error(src, url)
         if can_solve and (challenged or tracker.awaiting_followup(cookie=cookie, src=src)):
@@ -361,6 +376,7 @@ def harvest_cookie_interactive(
     *,
     try_auto_solve: bool = False,
     quiet: bool = False,
+    juris: str = "on",
 ) -> tuple[str, str]:
     """Open Chrome; close only when captcha flow fully complete."""
     from seleniumbase import SB
@@ -369,7 +385,7 @@ def harvest_cookie_interactive(
         print("\n>>> Opening Chrome...", flush=True)
     with SB(uc=True, headed=True, locale="en", **tor_util.sb_proxy_kw()) as sb:
         sb.activate_cdp_mode(START_URL)
-        return run_harvest_loop(sb, try_auto_solve=try_auto_solve, quiet=quiet)
+        return run_harvest_loop(sb, try_auto_solve=try_auto_solve, quiet=quiet, juris=juris)
 
 
 def _handle_ip_block_from_harvest(*, quiet: bool = False) -> None:

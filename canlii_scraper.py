@@ -120,25 +120,63 @@ def make_session() -> requests.Session:
     )
 
 
-def check_session(juris: str = "on") -> bool:
-    """True when the session can load a jurisdiction landing page (fast, ~20s max)."""
-    cookies = _load_cookies()
-    if "datadome" not in cookies:
+def chrome_major_from_ua(ua: str) -> str:
+    m = re.search(r"Chrome/(\d+)", ua)
+    return m.group(1) if m else "146"
+
+
+def headers_for_ua(ua: str | None = None) -> dict:
+    """Chrome client hints aligned with the harvested browser UA."""
+    ua = (ua or "").strip() or HEADERS.get("user-agent", "")
+    major = chrome_major_from_ua(ua)
+    h = dict(HEADERS)
+    h["user-agent"] = ua
+    h["sec-ch-ua"] = f'"Google Chrome";v="{major}", "Chromium";v="{major}", "Not)A;Brand";v="24"'
+    h["sec-ch-ua-full-version-list"] = (
+        f'"Google Chrome";v="{major}.0.0.0", "Chromium";v="{major}.0.0.0", '
+        f'"Not)A;Brand";v="24.0.0.0"'
+    )
+    return h
+
+
+def cookie_str_to_dict(cookie: str) -> dict:
+    jar: dict[str, str] = {}
+    for part in cookie.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            jar[k.strip()] = v.strip()
+    return jar
+
+
+def probe_harvested_session(cookie: str, ua: str, juris: str = "on") -> bool:
+    """True when cookie+UA work over HTTP (same check as after harvest)."""
+    if "datadome=" not in cookie:
         return False
     try:
         session = requests.Session(
             impersonate=IMPERSONATE,
-            headers=HEADERS,
-            cookies=_load_cookies(),
+            headers=headers_for_ua(ua),
+            cookies=cookie_str_to_dict(cookie),
             timeout=CHECK_TIMEOUT,
         )
         r = tor_util.session_get(session, f"{BASE}/en/{juris}/")
         if _is_challenge(r) or r.status_code != 200:
             return False
-        dbs = parse_databases_html(r.text, juris)
-        return bool(dbs)
+        return bool(parse_databases_html(r.text, juris))
     except Exception:
         return False
+
+
+def check_session(juris: str = "on") -> bool:
+    """True when the session can load a jurisdiction landing page (fast, ~20s max)."""
+    import session as sess
+
+    cookie = getattr(sess, "COOKIE", "")
+    if "datadome=" not in cookie:
+        return False
+    ua = getattr(sess, "USER_AGENT", "")
+    return probe_harvested_session(cookie, ua, juris)
 
 
 def _is_challenge(r) -> bool:

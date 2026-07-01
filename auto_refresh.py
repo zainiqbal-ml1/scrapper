@@ -314,7 +314,7 @@ def print_harvest_capabilities(*, force_recheck: bool = True) -> bool:
     return capable
 
 
-def _try_sb_mint(*, quiet: bool = False) -> str:
+def _try_sb_mint(*, quiet: bool = False, juris: str = "on") -> str:
     """Auto-solve DataDome slider via SeleniumBase + PyAutoGUI."""
     global LAST_UA
     try:
@@ -322,7 +322,7 @@ def _try_sb_mint(*, quiet: bool = False) -> str:
 
         if not quiet:
             print("\n>>> Auto-solving DataDome slider...\n", flush=True)
-        cookie = sb_mint.harvest_cookie()
+        cookie = sb_mint.harvest_cookie(juris=juris)
         if "datadome=" in cookie:
             LAST_UA = sb_mint.LAST_UA
             return cookie.strip()
@@ -335,11 +335,11 @@ def _try_sb_mint(*, quiet: bool = False) -> str:
     return ""
 
 
-def _harvest_via_selenium(*, try_auto: bool, quiet: bool) -> str:
+def _harvest_via_selenium(*, try_auto: bool, quiet: bool, juris: str = "on") -> str:
     global LAST_UA
     try:
         cookie, ua = browser_harvest.harvest_cookie_interactive(
-            try_auto_solve=try_auto, quiet=quiet,
+            try_auto_solve=try_auto, quiet=quiet, juris=juris,
         )
     except browser_harvest.HarvestConnectivityError:
         if not quiet:
@@ -358,12 +358,12 @@ def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _try_auto_slider_first(*, quiet: bool = False) -> str:
+def _try_auto_slider_first(*, quiet: bool = False, juris: str = "on") -> str:
     """SeleniumBase + PyAutoGUI before AppleScript (AppleScript cannot drag the slider)."""
     if platform_util.is_macos():
-        return _try_sb_mint(quiet=quiet)
+        return _try_sb_mint(quiet=quiet, juris=juris)
     if auto_solve_capable(force_recheck=True):
-        return _try_sb_mint(quiet=quiet)
+        return _try_sb_mint(quiet=quiet, juris=juris)
     return ""
 
 
@@ -371,21 +371,21 @@ def _accept_cookie(cookie: str, ua: str, *, juris: str = "on") -> str:
     """Persist cookie and confirm it loads CanLII before accepting."""
     if "datadome=" not in cookie:
         return ""
+    import canlii_scraper as cs
+
+    if not cs.probe_harvested_session(cookie, ua, juris):
+        print(">>> Session check failed — retrying harvest...\n", flush=True)
+        return ""
     update_session_cookie(cookie, ua)
     import importlib
-
-    import canlii_scraper as cs
     import session
 
     importlib.reload(session)
     cs.HEADERS = session.HEADERS
-    if cs.check_session(juris):
-        return cookie
-    print(">>> Session check failed — retrying harvest...\n", flush=True)
-    return ""
+    return cookie
 
 
-def harvest_cookie() -> str:
+def harvest_cookie(*, juris: str = "on") -> str:
     """Harvest a validated cookie — auto slider first when permitted."""
     global LAST_UA
     LAST_UA = ""
@@ -403,21 +403,21 @@ def harvest_cookie() -> str:
             if attempt == 0:
                 print("Tor on — routing cookie harvest through Tor (SeleniumBase).\n", flush=True)
 
-            cookie = _try_sb_mint(quiet=False)
+            cookie = _try_sb_mint(quiet=False, juris=juris)
             if cookie:
-                cookie = _accept_cookie(cookie, LAST_UA)
+                cookie = _accept_cookie(cookie, LAST_UA, juris=juris)
             if cookie:
                 return cookie
-            cookie = _harvest_via_selenium(try_auto=True, quiet=False)
+            cookie = _harvest_via_selenium(try_auto=True, quiet=False, juris=juris)
             if cookie:
-                cookie = _accept_cookie(cookie, LAST_UA)
+                cookie = _accept_cookie(cookie, LAST_UA, juris=juris)
             if cookie:
                 return cookie
             continue
 
-        cookie = _try_auto_slider_first(quiet=False)
+        cookie = _try_auto_slider_first(quiet=False, juris=juris)
         if cookie:
-            cookie = _accept_cookie(cookie, LAST_UA)
+            cookie = _accept_cookie(cookie, LAST_UA, juris=juris)
         if cookie:
             return cookie
         break
@@ -466,6 +466,19 @@ def update_session_cookie(cookie: str, ua: str = "") -> None:
     src = re.sub(r'COOKIE = \(\s*"[^"]*"\s*\)', f'COOKIE = (\n    "{cookie}"\n)', src, count=1, flags=re.S)
     if ua:
         src = re.sub(r'USER_AGENT = \(\s*"[^"]*"\s*\)', f'USER_AGENT = (\n    "{ua}"\n)', src, count=1, flags=re.S)
+        major = re.search(r"Chrome/(\d+)", ua)
+        ver = major.group(1) if major else "146"
+        src = re.sub(
+            r'"sec-ch-ua":\s*"[^"]*"',
+            f'"sec-ch-ua": \'"Google Chrome";v="{ver}", "Chromium";v="{ver}", "Not)A;Brand";v="24"\'',
+            src,
+        )
+        src = re.sub(
+            r'"sec-ch-ua-full-version-list":\s*"[^"]*"',
+            '"sec-ch-ua-full-version-list": '
+            f'\'"Google Chrome";v="{ver}.0.0.0", "Chromium";v="{ver}.0.0.0", "Not)A;Brand";v="24.0.0.0"\'',
+            src,
+        )
     SESSION_FILE.write_text(src)
     if COOKIE_STATE.exists():
         COOKIE_STATE.unlink()

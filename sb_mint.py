@@ -17,18 +17,18 @@ START_URL = browser_harvest.START_URL
 LAST_UA = ""
 
 
-def _mint() -> tuple[str, str]:
+def _mint(*, juris: str = "on") -> tuple[str, str]:
     from seleniumbase import SB
 
     with SB(uc=True, headed=True, locale="en", **tor_util.sb_proxy_kw()) as sb:
         sb.activate_cdp_mode(START_URL)
         print("\n>>> DataDome slider — auto-solving (SeleniumBase + mouse)...\n", flush=True)
-        return browser_harvest.run_harvest_loop(sb, try_auto_solve=True, quiet=False)
+        return browser_harvest.run_harvest_loop(sb, try_auto_solve=True, quiet=False, juris=juris)
 
 
-def harvest_cookie() -> str:
+def harvest_cookie(*, juris: str = "on") -> str:
     global LAST_UA
-    cookie, ua = _mint()
+    cookie, ua = _mint(juris=juris)
     if "datadome=" in cookie:
         LAST_UA = ua
         return cookie

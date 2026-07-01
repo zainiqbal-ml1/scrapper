@@ -126,15 +126,16 @@ class SessionCookies:
         self._backup_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._backup_enabled = backup_enabled
+        self.juris = "on"
         if backup_enabled:
             self.kick_backup()
 
-    def harvest_fresh(self, *, quiet: bool = False) -> str:
+    def harvest_fresh(self, *, quiet: bool = False, juris: str = "on") -> str:
         with self._harvest_lock:
             if not quiet:
                 print("\n>>> Harvesting a fresh cookie...\n", flush=True)
             for _ in range(self.MAX_HARVEST_RETRIES):
-                cookie = auto_refresh.harvest_cookie()
+                cookie = auto_refresh.harvest_cookie(juris=juris)
                 if cookie and "datadome=" in cookie:
                     auto_refresh.update_session_cookie(
                         cookie, getattr(auto_refresh, "LAST_UA", "") or "",
@@ -192,7 +193,7 @@ class SessionCookies:
             print("    (using backup cookie)", flush=True)
             self.kick_backup()
             return backup_cookie
-        cookie = self.harvest_fresh()
+        cookie = self.harvest_fresh(juris=self.juris)
         self.kick_backup()
         return cookie
 
@@ -204,11 +205,10 @@ _local = threading.local()
 
 
 def _request_headers() -> dict:
-    headers = dict(HEADERS)
-    ua = getattr(auto_refresh, "LAST_UA", "") or headers.get("user-agent", "")
+    ua = getattr(auto_refresh, "LAST_UA", "") or ""
     if ua:
-        headers["user-agent"] = ua
-    return headers
+        return cs.headers_for_ua(ua)
+    return dict(HEADERS)
 
 
 def get_session(sessions: SessionCookies, force_new: bool = False) -> requests.Session:
@@ -485,6 +485,7 @@ def _get_items(
 
 
 def _scrape_juris(sessions, limiter, juris, db_arg, args, grand) -> None:
+    sessions.juris = juris
     out = cs.OUT_ROOT
     all_dbs = _discover_databases(sessions, limiter, juris)
     targets = list(all_dbs.keys()) if db_arg == ["all"] else db_arg
