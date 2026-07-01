@@ -7,6 +7,7 @@ import tempfile
 import time
 
 from browser_harvest import (
+    FOLLOWUP_JS,
     POLL_INTERVAL,
     POLL_JS,
     START_URL,
@@ -136,15 +137,27 @@ def harvest_linux_fast(*, quiet: bool = True) -> tuple[str, str]:
             )
             stall_reason = stall.check(
                 src=src_hint, url=url, cookie=cookie, challenged=challenged, cdp_ok=True,
+                hold=challenged or tracker.holding_stall(),
             )
             if stall_reason:
                 if not quiet:
                     print(f">>> Harvest stalled ({stall_reason}).\n", flush=True)
                 raise HarvestConnectivityError(stall_reason)
 
-            if tracker.update(cookie=cookie, challenged=challenged, src=src_hint):
-                passed = True
-                break
+            followup = ""
+            try:
+                followup = driver.execute_script(f"return {FOLLOWUP_JS}") or ""
+            except Exception:
+                pass
+            challenged = challenged or bool(followup)
+
+            if tracker.update(
+                cookie=cookie, challenged=challenged, src=src_hint, url=url, followup=followup,
+            ):
+                if browser_harvest.harvest_complete_verified(cookie, src_hint, url):
+                    passed = True
+                    break
+                tracker.streak = 0
 
             if challenged:
                 if not prompt_shown:

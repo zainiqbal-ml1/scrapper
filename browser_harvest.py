@@ -14,6 +14,21 @@ START_URL = "https://www.canlii.org/en/on/"
 POLL_INTERVAL = 0.25
 STABLE_POLLS_CLEAR = 4          # ~1s with no captcha on the path
 STABLE_POLLS_AFTER_CAPTCHA = 12  # ~3s stable pass after slider / captcha steps
+POST_SLIDER_GUARD_POLLS = 6      # ~1.5s watch for follow-up captcha after slider
+
+# Live DOM check — catches 2nd captcha before it appears in page_source snapshot.
+FOLLOWUP_JS = (
+    "(()=>{"
+    "const t=(document.body&&document.body.innerText||'').toLowerCase();"
+    "const h=(document.documentElement&&document.documentElement.innerHTML||'').toLowerCase();"
+    "const u=location.href.toLowerCase();"
+    "if(u.includes('captcha-delivery')||u.includes('geo.captcha'))return 'delivery';"
+    "if(t.includes('proceed with our captcha')||t.includes('calls upon users accessing'))return 'canlii';"
+    "if(document.querySelector('iframe[src*=\"recaptcha\"],iframe[src*=\"captcha-delivery\"],iframe[title*=\"reCAPTCHA\"]'))return 'iframe';"
+    "if(h.includes('g-recaptcha')||h.includes('google.com/recaptcha'))return 'recaptcha';"
+    "return '';"
+    "})()"
+)
 
 # Chrome / proxy failure pages (not time-based — detected from page content).
 _CONNECTIVITY_MARKERS = (
@@ -65,9 +80,14 @@ class HarvestStallTracker:
         cookie: str,
         challenged: bool,
         cdp_ok: bool,
+        hold: bool = False,
     ) -> str | None:
         if page_connectivity_error(src, url):
             return "connectivity_error"
+        if hold:
+            self.blank_streak = 0
+            self.cdp_fails = 0
+            return None
         if not cdp_ok:
             self.cdp_fails += 1
             if self.cdp_fails >= self.CDP_FAIL_LIMIT:
@@ -150,9 +170,28 @@ def harvest_complete(cookie: str, src: str) -> bool:
     )
 
 
-def finalize_harvest(cookie: str, src: str) -> str:
-    """Return cookie only when harvest_complete; otherwise empty (invalid partial)."""
-    return cookie.strip() if harvest_complete(cookie, src) else ""
+def harvest_complete_verified(
+    cookie: str, src: str, url: str = "", *, followup: str = "",
+) -> bool:
+    """Stricter pass check — rejects partial pages and pending follow-up captchas."""
+    if followup:
+        return False
+    if not harvest_complete(cookie, src):
+        return False
+    u = (url or "").lower()
+    if "captcha-delivery" in u or "geo.captcha" in u:
+        return False
+    low = (src or "").lower()
+    if "proceed with our captcha" in low or "calls upon users accessing" in low:
+        return False
+    if "g-recaptcha" in low or "google.com/recaptcha" in low:
+        return False
+    return True
+
+
+def finalize_harvest(cookie: str, src: str, url: str = "") -> str:
+    """Return cookie only when the session is fully verified."""
+    return cookie.strip() if harvest_complete_verified(cookie, src, url) else ""
 
 
 def is_datadome_slider_html(src: str) -> bool:
@@ -195,22 +234,54 @@ def cookie_ready(cookie: str, *, challenged: bool) -> bool:
 
 
 class StablePassTracker:
-    """Require consecutive complete polls before closing (longer after captcha)."""
+    """Require consecutive verified polls before closing (longer after captcha)."""
 
     def __init__(self) -> None:
         self.captcha_seen = False
         self.streak = 0
         self._second_hint = False
+        self._on_slider = False
+        self._post_slider_guard = 0
 
-    def update(self, *, cookie: str, challenged: bool, src: str) -> bool:
-        if challenged or is_recaptcha_html(src):
-            if self.captcha_seen:
+    def holding_stall(self) -> bool:
+        """True while waiting for a possible follow-up captcha after the slider."""
+        return self._post_slider_guard > 0
+
+    def update(
+        self,
+        *,
+        cookie: str,
+        challenged: bool,
+        src: str,
+        url: str = "",
+        followup: str = "",
+    ) -> bool:
+        on_slider = is_datadome_slider_html(src)
+        followup_active = bool(followup) or is_canlii_native_captcha_html(src) or is_recaptcha_html(src)
+
+        if on_slider:
+            self._on_slider = True
+        elif self._on_slider and not followup_active and not challenged:
+            if self._post_slider_guard == 0:
+                self._post_slider_guard = POST_SLIDER_GUARD_POLLS
+            self._on_slider = False
+
+        if challenged or followup_active:
+            if self.captcha_seen and not on_slider:
                 self._second_hint = True
             self.captcha_seen = True
+            self._post_slider_guard = 0
+            self.streak = 0
+            if on_slider:
+                self._on_slider = True
+            return False
+
+        if self._post_slider_guard > 0:
+            self._post_slider_guard -= 1
             self.streak = 0
             return False
 
-        if not harvest_complete(cookie, src):
+        if not harvest_complete_verified(cookie, src, url):
             self.streak = 0
             return False
 
@@ -272,7 +343,13 @@ def run_harvest_loop(sb, *, try_auto_solve: bool = False, quiet: bool = False) -
             cookie = ua = ""
             cdp_ok = False
 
-        challenged = page_challenged_html(src)
+        followup = ""
+        try:
+            followup = sb.cdp.evaluate(FOLLOWUP_JS) or ""
+        except Exception:
+            pass
+
+        challenged = page_challenged_html(src) or bool(followup)
 
         if page_ip_blocked_html(src):
             _handle_ip_block_from_harvest(quiet=quiet)
@@ -280,16 +357,21 @@ def run_harvest_loop(sb, *, try_auto_solve: bool = False, quiet: bool = False) -
 
         stall_reason = stall.check(
             src=src, url=url, cookie=cookie, challenged=challenged, cdp_ok=cdp_ok,
+            hold=challenged or tracker.holding_stall(),
         )
         if stall_reason:
             if not quiet:
                 print(f">>> Harvest stalled ({stall_reason}) — trying another exit.\n", flush=True)
             raise HarvestConnectivityError(stall_reason)
 
-        if tracker.update(cookie=cookie, challenged=challenged, src=src):
-            break
+        if tracker.update(
+            cookie=cookie, challenged=challenged, src=src, url=url, followup=followup,
+        ):
+            if harvest_complete_verified(cookie, src, url):
+                break
+            tracker.streak = 0
 
-        if challenged or tracker.awaiting_followup(cookie=cookie, src=src):
+        if challenged or tracker.awaiting_followup(cookie=cookie, src=src) or tracker.holding_stall():
             if not prompt_shown:
                 prompt_shown = True
                 if is_datadome_slider_html(src):
@@ -306,7 +388,7 @@ def run_harvest_loop(sb, *, try_auto_solve: bool = False, quiet: bool = False) -
 
         time.sleep(POLL_INTERVAL)
 
-    cookie = finalize_harvest(cookie, src)
+    cookie = finalize_harvest(cookie, src, url)
     if cookie and not quiet:
         print(">>> Cookie captured — window closed.\n", flush=True)
     elif not cookie and not quiet:
