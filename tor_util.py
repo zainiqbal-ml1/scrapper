@@ -6,14 +6,18 @@ with its own exit IP and cookie (see tor-lane2.torrc for lane 1).
 from __future__ import annotations
 
 import os
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 _ENABLED = False
 _LANES: list["_Lane"] = []
 _TLS = threading.local()
+_LANE2_PROC: subprocess.Popen | None = None
 
 DEFAULT_GOOD_EXIT_PDF_THRESHOLD = 10
 GOOD_EXIT_PDF_THRESHOLD = DEFAULT_GOOD_EXIT_PDF_THRESHOLD
@@ -114,6 +118,61 @@ def _pick_port(candidates: tuple[int, ...], used: set[int]) -> int | None:
     return None
 
 
+def _find_tor_binary() -> str | None:
+    for candidate in ("tor", "/opt/homebrew/bin/tor", "/usr/local/bin/tor"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("tor")
+
+
+def _lane2_torrc() -> Path:
+    return Path(__file__).resolve().parent / "tor-lane2.torrc"
+
+
+def _try_spawn_lane2_tor() -> bool:
+    """Start tor daemon for lane 1 if port 9052 is not already listening."""
+    global _LANE2_PROC
+    if _port_open("127.0.0.1", 9052):
+        return True
+    tor_bin = _find_tor_binary()
+    torrc = _lane2_torrc()
+    if not tor_bin:
+        return False
+    if not torrc.exists():
+        return False
+    print(f"[tor] Starting lane 1 ({tor_bin} -f {torrc.name})...", flush=True)
+    try:
+        _LANE2_PROC = subprocess.Popen(
+            [tor_bin, "-f", str(torrc)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    for _ in range(60):
+        if _port_open("127.0.0.1", 9052):
+            print("[tor] Lane 1 ready on SOCKS 9052.\n", flush=True)
+            return True
+        if _LANE2_PROC.poll() is not None:
+            return False
+        time.sleep(0.5)
+    return False
+
+
+def _lane1_unavailable_message(lane_idx: int) -> str:
+    tor_bin = _find_tor_binary()
+    torrc = _lane2_torrc()
+    lines = [
+        f"Tor lane {lane_idx} is not available (need a second SOCKS port on 9052).",
+    ]
+    if not tor_bin:
+        lines.append("  Install tor:  brew install tor")
+    lines.append(f"  Then re-run (auto-starts lane 1), or in another terminal:")
+    lines.append(f"    tor -f {torrc}")
+    lines.append(f"  Or set TOR_LANE{lane_idx}_SOCKS_PORT to an open SOCKS port.")
+    return "\n".join(lines)
+
+
 def _build_lanes(n: int) -> list[_Lane]:
     used: set[int] = set()
     lanes: list[_Lane] = []
@@ -139,12 +198,11 @@ def _build_lanes(n: int) -> list[_Lane]:
         else:
             extra = tuple(9050 + i * 2 + off for off in range(6))
             port = _pick_port(_LANE1_PORTS if i == 1 else extra, used)
+        if port is None and i == 1:
+            _try_spawn_lane2_tor()
+            port = _pick_port(_LANE1_PORTS if i == 1 else extra, used)
         if port is None:
-            raise RuntimeError(
-                f"Tor lane {i} is not available (need a second SOCKS port).\n"
-                "  In another terminal: tor -f tor-lane2.torrc\n"
-                f"  Or set TOR_LANE{i}_SOCKS_PORT to an open SOCKS port."
-            )
+            raise RuntimeError(_lane1_unavailable_message(i))
         used.add(port)
         ci = _env_port(f"TOR_LANE{i}_CONTROL_PORT")
         lanes.append(_Lane(i, port, ci or _default_control_port(port)))
