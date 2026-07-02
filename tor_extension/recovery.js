@@ -2,9 +2,12 @@
 
 const CanliiRecovery = (() => {
   const SETTINGS_KEY = "canliiExtSettings";
-  const NATIVE_HOST = "com.canlii.tor";
   const MAX_RECOVERY = 12;
-  const CANLII_ORIGINS = ["https://www.canlii.org", "https://canlii.org"];
+
+  const USER_NEW_IDENTITY_MSG =
+    "Blocked — click Tor menu → New Identity. " +
+    "Your CanLII listing page will reopen and downloads resume automatically. " +
+    "Solve captcha if shown.";
 
   let startDownloadsFn = null;
   let pingTabFn = null;
@@ -37,59 +40,6 @@ const CanliiRecovery = (() => {
     return CanliiLib.listingUrl(ctx.juris, ctx.db, String(new Date().getFullYear()));
   }
 
-  async function requestNewIdentity() {
-    try {
-      const res = await browser.runtime.sendNativeMessage(NATIVE_HOST, {
-        action: "new_identity",
-      });
-      return res && res.ok ? res : null;
-    } catch (e) {
-      console.warn("[canlii-ext] native New Identity failed:", e);
-      return null;
-    }
-  }
-
-  async function clearCanliiSession() {
-    try {
-      await browser.browsingData.remove(
-        { origins: CANLII_ORIGINS },
-        {
-          cookies: true,
-          cache: true,
-          localStorage: true,
-          indexedDB: true,
-          serviceWorkers: true,
-        }
-      );
-    } catch (e) {
-      console.warn("[canlii-ext] could not clear browsing data:", e);
-    }
-  }
-
-  async function closeCanliiTabs() {
-    const tabs = await browser.tabs.query({ url: "*://www.canlii.org/*" });
-    await Promise.all(
-      tabs.map((t) => (t.id ? browser.tabs.remove(t.id).catch(() => {}) : null))
-    );
-  }
-
-  async function openFreshWindow(listingUrl) {
-    const win = await browser.windows.create({ url: listingUrl, focused: true });
-    const tabId = win.tabs && win.tabs[0] && win.tabs[0].id;
-    if (!tabId) throw new Error("Could not open a fresh CanLII window.");
-    await waitTabFn(tabId);
-    return { windowId: win.id, tabId };
-  }
-
-  async function closeOtherWindows(keepWindowId) {
-    const wins = await browser.windows.getAll({ windowTypes: ["normal"] });
-    for (const w of wins) {
-      if (w.id !== keepWindowId) {
-        await browser.windows.remove(w.id).catch(() => {});
-      }
-    }
-  }
-
   async function waitForSession(tabId, listingUrl, timeoutMs = 600000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -109,22 +59,50 @@ const CanliiRecovery = (() => {
     return false;
   }
 
-  async function resumeAfterRecovery(job) {
-    if (!startDownloadsFn || !job) return false;
-    const needUrl = listingUrlForJob(job);
+  async function openListingPage(needUrl) {
+    const wins = await browser.windows.getAll({ windowTypes: ["normal"] });
     let tabId = null;
 
-    const tabs = await browser.tabs.query({ url: "*://www.canlii.org/*" });
-    if (tabs.length && tabs[0].id) {
-      tabId = tabs[0].id;
-      await browser.tabs.update(tabId, { url: needUrl, active: true });
+    if (wins.length && wins[0].id) {
+      const tabs = await browser.tabs.query({ windowId: wins[0].id });
+      if (tabs.length && tabs[0].id) {
+        tabId = tabs[0].id;
+        await browser.tabs.update(tabId, { url: needUrl, active: true });
+      } else {
+        const tab = await browser.tabs.create({ windowId: wins[0].id, url: needUrl, active: true });
+        tabId = tab.id;
+      }
     } else {
       const win = await browser.windows.create({ url: needUrl, focused: true });
       tabId = win.tabs && win.tabs[0] && win.tabs[0].id;
     }
+
+    if (!tabId) return null;
+    await waitTabFn(tabId);
+    return tabId;
+  }
+
+  async function resumeAfterNewIdentity(job) {
+    if (!startDownloadsFn || !job) return false;
+    const needUrl = listingUrlForJob(job);
+
+    if (saveProgressFn) {
+      await saveProgressFn({
+        status: "recovering",
+        listingUrl: needUrl,
+        current: job.completed || 0,
+        total: job.total || 0,
+        skipped: job.skipped || 0,
+        alreadyDone: job.alreadyDone || 0,
+        error: "New Identity done — reopening your CanLII page…",
+        mode: "pdf-tabs",
+      });
+    }
+
+    await sleep(3000);
+    const tabId = await openListingPage(needUrl);
     if (!tabId) return false;
 
-    await waitTabFn(tabId);
     const ready = await waitForSession(tabId, needUrl);
     if (!ready) {
       await CanliiStore.saveJob({
@@ -142,7 +120,7 @@ const CanliiRecovery = (() => {
           skipped: job.skipped || 0,
           alreadyDone: job.alreadyDone || 0,
           error:
-            "New Identity done — solve captcha on the CanLII page, then click Resume.",
+            "Page reopened — solve captcha on CanLII, then click Resume.",
           mode: "pdf-tabs",
         });
       }
@@ -178,23 +156,11 @@ const CanliiRecovery = (() => {
     if (resumeInFlight) return;
     const job = await CanliiStore.getJob();
     if (!job || !job.pendingNewIdentityResume) return;
+    if (job.status !== "needs_new_identity" && job.status !== "recovering") return;
 
     resumeInFlight = true;
     try {
-      if (saveProgressFn) {
-        await saveProgressFn({
-          status: "recovering",
-          listingUrl: job.listingUrl,
-          current: job.completed || 0,
-          total: job.total || 0,
-          skipped: job.skipped || 0,
-          alreadyDone: job.alreadyDone || 0,
-          error: "New Identity complete — reopening CanLII and resuming…",
-          mode: "pdf-tabs",
-        });
-      }
-      await sleep(6000);
-      await resumeAfterRecovery(job);
+      await resumeAfterNewIdentity(job);
     } catch (e) {
       console.warn("[canlii-ext] post New Identity resume failed:", e);
       await CanliiStore.saveJob({
@@ -207,125 +173,48 @@ const CanliiRecovery = (() => {
     }
   }
 
-  async function fallbackRecover({ job, listingUrl, progress, message, needUrl }) {
-    await closeCanliiTabs();
-    await clearCanliiSession();
-    await sleep(2500);
-
-    const { windowId, tabId } = await openFreshWindow(needUrl);
-    await closeOtherWindows(windowId);
-
-    const ready = await waitForSession(tabId, needUrl);
-    if (!ready) {
-      await CanliiStore.saveJob({
-        ...job,
-        status: "needs_reload",
-        pendingNewIdentityResume: false,
-        listingUrl: needUrl,
-      });
-      if (saveProgressFn) {
-        await saveProgressFn({
-          status: "needs_reload",
-          listingUrl: needUrl,
-          current: progress.completed,
-          total: progress.total,
-          skipped: progress.skipped,
-          alreadyDone: progress.alreadyDone,
-          error:
-            "Recovery waiting for captcha — solve it on CanLII, then click Resume.",
-          source: progress.source,
-          mode: "pdf-tabs",
-        });
-      }
-      return false;
-    }
-
-    await startDownloadsFn(
-      {
-        resume: true,
-        listingUrl: needUrl,
-        allYears: job.allYears,
-        subfolder: job.subfolder,
-        batchSize: job.batchSize,
-        batchPauseMs: job.batchPauseMs,
-        skipDone: true,
-        autoRecovery: true,
-      },
-      tabId
-    );
-    return true;
-  }
-
   async function tryRecover({ job, listingUrl, progress, message }) {
     if (!startDownloadsFn) return false;
 
     const settings = await getSettings();
-    if (!settings.autoRecover) return false;
-
     const attempts = (job.recoveryAttempts || 0) + 1;
     if (attempts > MAX_RECOVERY) return false;
 
     const needUrl = listingUrlForJob(job);
-    const note =
-      message ||
-      "Blocked — requesting Tor New Identity, then auto-resuming.";
+    const auto = settings.autoRecover !== false;
 
     await CanliiStore.saveJob({
       ...job,
-      status: "recovering",
+      status: auto ? "needs_new_identity" : "needs_reload",
       recoveryAttempts: attempts,
       listingUrl: needUrl,
-      pendingNewIdentityResume: true,
+      pendingNewIdentityResume: auto,
       completed: progress.completed,
       skipped: progress.skipped,
       alreadyDone: progress.alreadyDone,
       total: progress.total,
     });
 
+    const userMsg = auto
+      ? message || USER_NEW_IDENTITY_MSG
+      : message ||
+        "Blocked — click Tor → New Identity, reopen this listing, then click Resume.";
+
     if (saveProgressFn) {
       await saveProgressFn({
-        status: "recovering",
+        status: auto ? "needs_new_identity" : "needs_reload",
         listingUrl: needUrl,
         current: progress.completed,
         total: progress.total,
         skipped: progress.skipped,
         alreadyDone: progress.alreadyDone,
-        error: `${note} (recovery ${attempts}/${MAX_RECOVERY})`,
+        error: userMsg,
         source: progress.source,
         mode: "pdf-tabs",
       });
     }
 
-    const native = await requestNewIdentity();
-    if (native && native.method === "tor-menu") {
-      return true;
-    }
-
-    await CanliiStore.saveJob({
-      ...job,
-      status: "recovering",
-      recoveryAttempts: attempts,
-      listingUrl: needUrl,
-      pendingNewIdentityResume: false,
-    });
-
-    const detail =
-      native && native.detail
-        ? String(native.detail)
-        : "Install native host: run ./install_tor_extension.sh";
-    if (saveProgressFn) {
-      await saveProgressFn({
-        status: "recovering",
-        listingUrl: needUrl,
-        current: progress.completed,
-        total: progress.total,
-        error: `New Identity menu unavailable (${detail}) — using fallback recovery…`,
-        source: progress.source,
-        mode: "pdf-tabs",
-      });
-    }
-
-    return fallbackRecover({ job, listingUrl, progress, message, needUrl });
+    return true;
   }
 
   return {
@@ -334,6 +223,7 @@ const CanliiRecovery = (() => {
     continuePendingNewIdentity,
     listingUrlForJob,
     getSettings,
+    USER_NEW_IDENTITY_MSG,
     MAX_RECOVERY,
   };
 })();

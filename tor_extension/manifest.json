@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "CanLII PDF Bulk Download",
-  "version": "1.5.0",
-  "description": "Bulk-download CanLII PDFs in Tor Browser — auto-resume, skip existing, per-year JSON.",
+  "version": "1.5.1",
+  "description": "Bulk-download CanLII PDFs in Tor Browser — resume, skip existing, per-year JSON.",
   "applications": {
     "gecko": {
       "id": "canlii-pdf@local",
@@ -14,7 +14,6 @@
     "tabs",
     "storage",
     "browsingData",
-    "nativeMessaging",
     "https://www.canlii.org/*"
   ],
   "browser_action": {

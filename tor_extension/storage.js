@@ -71,9 +71,14 @@ const CanliiStore = (() => {
   function isResumable(job) {
     return (
       job &&
-      ["paused", "cancelled", "error", "needs_reload", "recovering"].includes(
-        job.status
-      )
+      [
+        "paused",
+        "cancelled",
+        "error",
+        "needs_reload",
+        "needs_new_identity",
+        "recovering",
+      ].includes(job.status)
     );
   }
 

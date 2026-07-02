@@ -44,7 +44,7 @@ async function tabMessage(type, payload) {
 async function updateResumeButton() {
   const res = await browser.runtime.sendMessage({ type: "get-job" });
   const job = res && res.job;
-  if (!job || !["paused", "cancelled", "error", "needs_reload", "recovering"].includes(job.status)) {
+  if (!job || !["paused", "cancelled", "error", "needs_reload", "needs_new_identity", "recovering"].includes(job.status)) {
     resumeBtn.style.display = "none";
     return;
   }
@@ -148,6 +148,15 @@ async function pollProgress() {
     setStatus(p.error || "Opening fresh Tor window — solve captcha if shown…", "ok");
     startBtn.disabled = true;
     resumeBtn.disabled = true;
+  } else if (p.status === "needs_new_identity") {
+    setStatus(
+      p.error ||
+        "Click Tor menu → New Identity. CanLII page will reopen and resume automatically.",
+      "err"
+    );
+    startBtn.disabled = false;
+    resumeBtn.disabled = false;
+    updateResumeButton();
   } else if (p.status === "needs_reload") {
     setStatus(
       p.error ||

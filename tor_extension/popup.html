@@ -64,9 +64,9 @@
     <input type="text" id="subfolder" placeholder="canlii/onlrb" />
   </label>
   <label><input type="checkbox" id="skipDone" checked /> Skip already downloaded (saved across restarts)</label>
-  <label><input type="checkbox" id="autoRecover" checked /> Auto-recover when blocked (fresh window + resume)</label>
+  <label><input type="checkbox" id="autoRecover" checked /> After block: prompt New Identity, then auto-reopen page &amp; resume</label>
 
-  <p class="muted">On block: clears CanLII cookies, opens a fresh window, waits for captcha, then resumes. Install permanently with <code>install_tor_extension.sh</code>.</p>
+  <p class="muted">When blocked: you click Tor → New Identity (no extra permissions). Extension reopens your listing and continues. Install permanently with <code>install_tor_extension.sh</code>.</p>
 
   <button id="resume" class="resume" type="button" style="display:none">Resume download</button>
   <button id="start">Download PDFs</button>

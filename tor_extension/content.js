@@ -251,10 +251,19 @@ function pollProgress(statusEl) {
       if (btnY) btnY.disabled = false;
       if (btnA) btnA.disabled = false;
       updateResumeButton();
+    } else if (prog.status === "needs_new_identity") {
+      statusEl.textContent =
+        prog.error ||
+        "Click Tor menu → New Identity. This page will reopen and resume automatically.";
+      clearInterval(poll);
+      if (btnY) btnY.disabled = false;
+      if (btnA) btnA.disabled = false;
+      if (btnR) btnR.disabled = false;
+      updateResumeButton();
     } else if (prog.status === "needs_reload") {
       statusEl.textContent =
         prog.error ||
-        "Reload this page (Tor: New Identity), solve captcha, then click Resume.";
+        "Reload this page, solve captcha, then click Resume.";
       clearInterval(poll);
       if (btnY) btnY.disabled = false;
       if (btnA) btnA.disabled = false;
@@ -446,9 +455,11 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const done = job.completed || 0;
       btnResume.style.display = "block";
       btnResume.textContent =
-        job.status === "needs_reload"
-          ? "Resume after reload"
-          : `Resume (${done} done, ${left} left)`;
+        job.status === "needs_new_identity"
+          ? "Resume after New Identity"
+          : job.status === "needs_reload"
+            ? "Resume after reload"
+            : `Resume (${done} done, ${left} left)`;
     } else {
       btnResume.style.display = "none";
     }
@@ -539,10 +550,15 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           ? prog.error || "Opening fresh Tor window…"
           : formatStatus(prog);
       pollProgress(status);
+    } else if (prog.status === "needs_new_identity") {
+      status.textContent =
+        prog.error ||
+        "Click Tor menu → New Identity. Page will reopen and resume automatically.";
+      updateResumeButton();
     } else if (prog.status === "needs_reload") {
       status.textContent =
         prog.error ||
-        "Reload this page (Tor: New Identity), solve captcha, then click Resume.";
+        "Reload this page, solve captcha, then click Resume.";
       updateResumeButton();
     }
   });
