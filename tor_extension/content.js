@@ -228,6 +228,8 @@ function pollProgress(statusEl) {
     const btnR = document.getElementById("canlii-pdf-resume-btn");
     if (prog.status === "running") {
       statusEl.textContent = formatStatus(prog);
+    } else if (prog.status === "recovering") {
+      statusEl.textContent = prog.error || "Opening fresh Tor window…";
     } else if (prog.status === "done") {
       const had = prog.alreadyDone ? `, ${prog.alreadyDone} already had` : "";
       const skip = prog.skipped ? ` (${prog.skipped} skipped)` : "";
@@ -258,6 +260,11 @@ function pollProgress(statusEl) {
       if (btnA) btnA.disabled = false;
       if (btnR) btnR.disabled = false;
       updateResumeButton();
+    } else if (prog.status === "recovering") {
+      statusEl.textContent = prog.error || "Opening fresh Tor window…";
+      if (btnY) btnY.disabled = true;
+      if (btnA) btnA.disabled = true;
+      if (btnR) btnR.disabled = true;
     }
   }, 1000);
   return poll;
@@ -266,6 +273,42 @@ function pollProgress(statusEl) {
 browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "ping") {
     sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.type === "check-session") {
+    const url = msg.listingUrl || location.href;
+    const ctx = CanliiLib.parseDbContext(url);
+    if (!ctx) {
+      sendResponse({ ok: false, error: "Not a CanLII page." });
+      return true;
+    }
+    injectBridge()
+      .then(async () => {
+        try {
+          const year =
+            ctx.year ||
+            scrapeYearsFromDom(ctx.juris, ctx.db)[0] ||
+            String(new Date().getFullYear());
+          const res = await pageCall(
+            "fetch-items",
+            { juris: ctx.juris, db: ctx.db, year },
+            90000
+          );
+          if (res.ok && res.text) {
+            const items = JSON.parse(res.text);
+            sendResponse({ ok: Array.isArray(items) && items.length > 0 });
+            return;
+          }
+          if (res.error === "captcha" || res.status === 403) {
+            sendResponse({ ok: false, captcha: true });
+            return;
+          }
+          sendResponse({ ok: false });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e.message || e) });
+        }
+      })
+      .catch((e) => sendResponse({ ok: false, error: String(e.message || e) }));
     return true;
   }
   if (msg.type === "parse-page") {
@@ -488,10 +531,13 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   browser.runtime.sendMessage({ type: "get-progress" }).then((p) => {
     const prog = p && p.progress;
     if (!prog) return;
-    if (prog.status === "running") {
+    if (prog.status === "running" || prog.status === "recovering") {
       btnYear.disabled = true;
       btnAll.disabled = true;
-      status.textContent = formatStatus(prog);
+      status.textContent =
+        prog.status === "recovering"
+          ? prog.error || "Opening fresh Tor window…"
+          : formatStatus(prog);
       pollProgress(status);
     } else if (prog.status === "needs_reload") {
       status.textContent =

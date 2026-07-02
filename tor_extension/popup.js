@@ -7,6 +7,7 @@ const batchSizeEl = document.getElementById("batchSize");
 const batchPauseEl = document.getElementById("batchPause");
 const subfolderEl = document.getElementById("subfolder");
 const skipDoneEl = document.getElementById("skipDone");
+const autoRecoverEl = document.getElementById("autoRecover");
 const startBtn = document.getElementById("start");
 const resumeBtn = document.getElementById("resume");
 const cancelBtn = document.getElementById("cancel");
@@ -43,7 +44,7 @@ async function tabMessage(type, payload) {
 async function updateResumeButton() {
   const res = await browser.runtime.sendMessage({ type: "get-job" });
   const job = res && res.job;
-  if (!job || !["paused", "cancelled", "error", "needs_reload"].includes(job.status)) {
+  if (!job || !["paused", "cancelled", "error", "needs_reload", "recovering"].includes(job.status)) {
     resumeBtn.style.display = "none";
     return;
   }
@@ -143,6 +144,10 @@ async function pollProgress() {
     startBtn.disabled = false;
     resumeBtn.disabled = false;
     updateResumeButton();
+  } else if (p.status === "recovering") {
+    setStatus(p.error || "Opening fresh Tor window — solve captcha if shown…", "ok");
+    startBtn.disabled = true;
+    resumeBtn.disabled = true;
   } else if (p.status === "needs_reload") {
     setStatus(
       p.error ||
@@ -201,6 +206,17 @@ async function startDownload(resume) {
 }
 
 allYearsEl.addEventListener("change", () => refreshPageInfo());
+
+autoRecoverEl.addEventListener("change", async () => {
+  await browser.storage.local.set({
+    canliiExtSettings: { autoRecover: autoRecoverEl.checked },
+  });
+});
+
+browser.storage.local.get("canliiExtSettings").then((data) => {
+  const s = data.canliiExtSettings || {};
+  if (s.autoRecover === false) autoRecoverEl.checked = false;
+});
 
 startBtn.addEventListener("click", () => startDownload(false));
 resumeBtn.addEventListener("click", () => startDownload(true));

@@ -216,7 +216,10 @@ async function fetchPdfFromListing(listingTabId, task) {
       return { skipped: true, reason: "404" };
     }
     if (res && res.error === "not-pdf") {
-      throw new Error(`${task.filename}: captcha/block (not a PDF)`);
+      return { blocked: true, error: "captcha/block (not a PDF)" };
+    }
+    if (status === 403 || err === "captcha") {
+      return { blocked: true, error: err };
     }
     throw new Error(
       `${task.filename}: HTTP ${status || err} — ${task.pdfUrl}`
@@ -366,6 +369,40 @@ async function runTabBatches({
 
   async function pauseForCircuitReload(customMsg) {
     await CanliiStore.unmarkSkippedMany(streak404Urls);
+    consecutive404 = 0;
+    streak404Urls = [];
+
+    const progress = {
+      completed,
+      skipped,
+      alreadyDone,
+      total: tasks.length,
+      source,
+    };
+
+    const currentJob = {
+      ...jobMeta,
+      status: "needs_reload",
+      completed,
+      skipped,
+      pending: tasks.length - completed,
+      alreadyDone,
+      total: tasks.length,
+      listingTabId,
+    };
+
+    await saveYearIndexes(yearRecords, outcomes, jsonBase).catch(() => {});
+
+    const recovered = await CanliiRecovery.tryRecover({
+      job: currentJob,
+      listingUrl,
+      progress,
+      message: customMsg,
+    });
+    if (recovered) {
+      return { autoRecovered: true, total: tasks.length, completed, skipped, alreadyDone };
+    }
+
     const errMsg =
       customMsg ||
       `${CONSECUTIVE_404_LIMIT} PDFs returned 404 in a row — likely blocked. ` +
@@ -382,7 +419,6 @@ async function runTabBatches({
       source,
       mode: "pdf-tabs",
     });
-    await saveYearIndexes(yearRecords, outcomes, jsonBase).catch(() => {});
     return {
       needsReload: true,
       total: tasks.length,
@@ -478,7 +514,12 @@ async function runTabBatches({
         const result = await fetchPdfFromListing(listingTabId, task);
         if (result.connectionLost) {
           return pauseForCircuitReload(
-            "Lost connection to the listing tab — refresh this CanLII page, solve captcha, then Resume."
+            "Lost connection — opening fresh Tor window…"
+          );
+        }
+        if (result.blocked) {
+          return pauseForCircuitReload(
+            `Blocked — opening fresh Tor window (${result.error || "403"})…`
           );
         }
         if (result.skipped) {
@@ -542,11 +583,14 @@ async function runTabBatches({
           continue;
         }
         if (isRetryableBlock(msg)) {
-          await sleep(10000);
+          await sleep(5000);
           try {
             await browser.tabs.update(tabId, { url: task.pdfUrl });
             await waitTabComplete(tabId);
             const retry = await fetchPdfFromListing(listingTabId, task);
+            if (retry.connectionLost) {
+              return pauseForCircuitReload("Connection lost — rotating Tor session…");
+            }
             if (retry.skipped) {
               const h404 = await handleTask404(task);
               if (h404.pause) {
@@ -560,16 +604,9 @@ async function runTabBatches({
             outcomes.set(task.pdfUrl, { ok: true });
             continue;
           } catch (e2) {
-            await touchJob("error");
-            await saveProgress({
-              status: "error",
-              listingUrl,
-              current: completed,
-              total: tasks.length,
-              skipped,
-              error: `${task.filename}: ${e2.message || e2}`,
-            });
-            throw e2;
+            return pauseForCircuitReload(
+              `Blocked (${task.filename}) — opening fresh Tor window…`
+            );
           }
         }
         await touchJob("error");
@@ -745,4 +782,11 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   return false;
+});
+
+CanliiRecovery.init({
+  startDownloads,
+  pingTab: pingContentTab,
+  waitTab: waitForContentTab,
+  saveProgress,
 });
