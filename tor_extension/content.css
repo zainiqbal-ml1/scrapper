@@ -1,0 +1,83 @@
+#canlii-pdf-bulk-bar {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  left: 16px;
+  z-index: 2147483646;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
+  padding: 16px 18px;
+  background: #1a3a5c;
+  color: #fff;
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.3);
+  font: 15px/1.4 system-ui, -apple-system, sans-serif;
+  width: min(520px, calc(100vw - 32px));
+  margin-left: auto;
+  box-sizing: border-box;
+}
+
+#canlii-pdf-bulk-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+
+#canlii-pdf-bulk-btn,
+#canlii-pdf-all-years-btn,
+#canlii-pdf-resume-btn {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  background: #2d7dd2;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 14px 16px;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-align: center;
+  cursor: pointer;
+  white-space: normal;
+  word-wrap: break-word;
+}
+
+#canlii-pdf-all-years-btn {
+  background: #1e8f5a;
+}
+
+#canlii-pdf-resume-btn {
+  background: #c77d1a;
+}
+
+#canlii-pdf-bulk-btn:hover:not(:disabled),
+#canlii-pdf-all-years-btn:hover:not(:disabled),
+#canlii-pdf-resume-btn:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+#canlii-pdf-bulk-btn:disabled,
+#canlii-pdf-all-years-btn:disabled,
+#canlii-pdf-resume-btn:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+
+#canlii-pdf-bulk-status {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 14px;
+  line-height: 1.45;
+  opacity: 0.95;
+  white-space: normal;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  min-height: 1.45em;
+  padding: 4px 2px 0;
+}
