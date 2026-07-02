@@ -790,3 +790,15 @@ CanliiRecovery.init({
   waitTab: waitForContentTab,
   saveProgress,
 });
+
+browser.windows.onCreated.addListener(() => {
+  CanliiRecovery.continuePendingNewIdentity().catch(() => {});
+});
+
+browser.runtime.onStartup.addListener(() => {
+  CanliiRecovery.continuePendingNewIdentity().catch(() => {});
+});
+
+setTimeout(() => {
+  CanliiRecovery.continuePendingNewIdentity().catch(() => {});
+}, 3000);

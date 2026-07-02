@@ -1,0 +1,7 @@
+{
+  "name": "com.canlii.tor",
+  "description": "Tor New Identity helper for CanLII PDF extension",
+  "path": "__HOST_PATH__",
+  "type": "stdio",
+  "allowed_extensions": ["canlii-pdf@local"]
+}
