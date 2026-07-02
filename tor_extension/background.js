@@ -1,6 +1,7 @@
 /* global browser, CanliiLib */
 
 const PROGRESS_KEY = "canliiPdfProgress";
+const CONSECUTIVE_404_LIMIT = 3;
 let cancelRequested = false;
 
 function sleep(ms) {
@@ -200,8 +201,12 @@ async function fetchPdfFromListing(listingTabId, task) {
       pdfPaths: task.pdfPaths || [task.pdfPath],
     });
   } catch (e) {
+    const err = String(e.message || e);
+    if (/receiving end does not exist|could not establish connection/i.test(err)) {
+      return { connectionLost: true };
+    }
     throw new Error(
-      `${task.filename}: keep the listing tab open — ${e.message || e}`
+      `${task.filename}: keep the listing tab open — ${err}`
     );
   }
   if (!res || !res.ok) {
@@ -229,6 +234,95 @@ function isSkippableError(msg) {
   return /HTTP 404\b|not-found|\b404\b.*skip/i.test(msg);
 }
 
+async function pingContentTab(tabId) {
+  try {
+    const res = await browser.tabs.sendMessage(tabId, { type: "ping" });
+    return !!(res && res.ok);
+  } catch (e) {
+    return false;
+  }
+}
+
+async function waitForContentTab(tabId, timeoutMs = 45000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const tab = await browser.tabs.get(tabId);
+      if (tab.status === "complete" && (await pingContentTab(tabId))) {
+        return tabId;
+      }
+    } catch (e) {
+      throw new Error("Listing tab closed — reopen the CanLII page and click Resume.");
+    }
+    await sleep(600);
+  }
+  throw new Error(
+    "Could not connect — refresh the CanLII page, solve captcha if shown, then Resume."
+  );
+}
+
+function listingUrlForContext(job, msg) {
+  const url = msg.listingUrl || (job && job.listingUrl) || "";
+  const ctx = CanliiLib.parseDbContext(url);
+  if (!ctx) return url;
+  if (ctx.year) {
+    return CanliiLib.listingUrl(ctx.juris, ctx.db, ctx.year);
+  }
+  if (job && job.year) {
+    return CanliiLib.listingUrl(ctx.juris, ctx.db, job.year);
+  }
+  const y = new Date().getFullYear();
+  return CanliiLib.listingUrl(ctx.juris, ctx.db, String(y));
+}
+
+async function ensureListingTab(msg) {
+  const job = msg.resume ? await CanliiStore.getJob() : null;
+  const targetUrl = msg.listingUrl || (job && job.listingUrl);
+  const ctx = CanliiLib.parseDbContext(targetUrl || "");
+  const needUrl = listingUrlForContext(job, msg);
+
+  if (msg.listingTabId) {
+    try {
+      await browser.tabs.get(msg.listingTabId);
+      if (await pingContentTab(msg.listingTabId)) {
+        return msg.listingTabId;
+      }
+      await browser.tabs.update(msg.listingTabId, { url: needUrl, active: true });
+      return waitForContentTab(msg.listingTabId);
+    } catch (e) {
+      /* try other tabs */
+    }
+  }
+
+  const tabs = await browser.tabs.query({ url: "*://www.canlii.org/*" });
+  let fallback = null;
+  for (const t of tabs) {
+    if (!t.id) continue;
+    const pageCtx = CanliiLib.parseDbContext(t.url || "");
+    if (!ctx || !pageCtx) continue;
+    if (pageCtx.juris === ctx.juris && pageCtx.db === ctx.db) {
+      fallback = t;
+      if (await pingContentTab(t.id)) return t.id;
+    }
+  }
+
+  if (fallback && fallback.id) {
+    await browser.tabs.update(fallback.id, { url: needUrl, active: true });
+    return waitForContentTab(fallback.id);
+  }
+
+  const tab = await browser.tabs.create({ url: needUrl, active: true });
+  return waitForContentTab(tab.id);
+}
+
+function friendlyConnectionError(err) {
+  const msg = String((err && err.message) || err || "");
+  if (/receiving end does not exist|could not establish connection/i.test(msg)) {
+    return "Refresh the CanLII listing page, solve captcha if needed, then click Resume.";
+  }
+  return msg;
+}
+
 async function closeTabs(tabIds) {
   await Promise.all(tabIds.map((id) => browser.tabs.remove(id).catch(() => {})));
 }
@@ -252,6 +346,8 @@ async function runTabBatches({
   cancelRequested = false;
   let completed = 0;
   let skipped = 0;
+  let consecutive404 = 0;
+  let streak404Urls = [];
   const outcomes = new Map();
 
   async function touchJob(status) {
@@ -264,7 +360,55 @@ async function runTabBatches({
       pending: tasks.length - completed,
       alreadyDone,
       total: tasks.length,
+      listingTabId,
     });
+  }
+
+  async function pauseForCircuitReload(customMsg) {
+    await CanliiStore.unmarkSkippedMany(streak404Urls);
+    const errMsg =
+      customMsg ||
+      `${CONSECUTIVE_404_LIMIT} PDFs returned 404 in a row — likely blocked. ` +
+      "Reload this CanLII page (Tor: New Identity or refresh), solve captcha, then click Resume.";
+    await touchJob("needs_reload");
+    await saveProgress({
+      status: "needs_reload",
+      listingUrl,
+      current: completed,
+      total: tasks.length,
+      skipped,
+      alreadyDone,
+      error: errMsg,
+      source,
+      mode: "pdf-tabs",
+    });
+    await saveYearIndexes(yearRecords, outcomes, jsonBase).catch(() => {});
+    return {
+      needsReload: true,
+      total: tasks.length,
+      completed,
+      skipped,
+      alreadyDone,
+    };
+  }
+
+  async function handleTask404(task) {
+    streak404Urls.push(task.pdfUrl);
+    consecutive404 += 1;
+    outcomes.set(task.pdfUrl, { skipped: true, error: "HTTP 404" });
+
+    if (consecutive404 >= CONSECUTIVE_404_LIMIT) {
+      return { pause: true };
+    }
+
+    await CanliiStore.markSkipped(task.pdfUrl);
+    skipped += 1;
+    return { pause: false };
+  }
+
+  function noteSuccess() {
+    consecutive404 = 0;
+    streak404Urls = [];
   }
 
   await saveProgress({
@@ -332,10 +476,16 @@ async function runTabBatches({
       const { tabId, task } = slot;
       try {
         const result = await fetchPdfFromListing(listingTabId, task);
+        if (result.connectionLost) {
+          return pauseForCircuitReload(
+            "Lost connection to the listing tab — refresh this CanLII page, solve captcha, then Resume."
+          );
+        }
         if (result.skipped) {
-          skipped += 1;
-          await CanliiStore.markSkipped(task.pdfUrl);
-          outcomes.set(task.pdfUrl, { skipped: true, error: "HTTP 404" });
+          const h404 = await handleTask404(task);
+          if (h404.pause) {
+            return pauseForCircuitReload();
+          }
           await touchJob("running");
           await saveProgress({
             status: "running",
@@ -352,6 +502,7 @@ async function runTabBatches({
           });
           continue;
         }
+        noteSuccess();
         completed += 1;
         await CanliiStore.markDone(task.pdfUrl);
         outcomes.set(task.pdfUrl, { ok: true });
@@ -372,9 +523,10 @@ async function runTabBatches({
       } catch (e) {
         const msg = String(e.message || e);
         if (isSkippableError(msg)) {
-          skipped += 1;
-          await CanliiStore.markSkipped(task.pdfUrl);
-          outcomes.set(task.pdfUrl, { skipped: true, error: msg });
+          const h404 = await handleTask404(task);
+          if (h404.pause) {
+            return pauseForCircuitReload();
+          }
           await touchJob("running");
           await saveProgress({
             status: "running",
@@ -396,11 +548,13 @@ async function runTabBatches({
             await waitTabComplete(tabId);
             const retry = await fetchPdfFromListing(listingTabId, task);
             if (retry.skipped) {
-              skipped += 1;
-              await CanliiStore.markSkipped(task.pdfUrl);
-              outcomes.set(task.pdfUrl, { skipped: true, error: "HTTP 404" });
+              const h404 = await handleTask404(task);
+              if (h404.pause) {
+                return pauseForCircuitReload();
+              }
               continue;
             }
+            noteSuccess();
             completed += 1;
             await CanliiStore.markDone(task.pdfUrl);
             outcomes.set(task.pdfUrl, { ok: true });
@@ -484,16 +638,25 @@ async function mergeResumeJob(msg) {
 }
 
 async function startDownloads(msg, listingTabId) {
-  if (!listingTabId) {
-    throw new Error("Reload the listing page and try again.");
-  }
   msg = await mergeResumeJob(msg);
+  let resolvedTabId;
+  try {
+    resolvedTabId = await ensureListingTab({ ...msg, listingTabId });
+  } catch (e) {
+    throw new Error(friendlyConnectionError(e));
+  }
+
   const prepType = msg.allYears ? "prepare-all-years" : "prepare-tasks";
-  const prep = await browser.tabs.sendMessage(listingTabId, {
-    type: prepType,
-    listingUrl: msg.listingUrl,
-    subfolder: msg.subfolder,
-  });
+  let prep;
+  try {
+    prep = await browser.tabs.sendMessage(resolvedTabId, {
+      type: prepType,
+      listingUrl: msg.listingUrl,
+      subfolder: msg.subfolder,
+    });
+  } catch (e) {
+    throw new Error(friendlyConnectionError(e));
+  }
   if (!prep || !prep.ok) {
     throw new Error((prep && prep.error) || "Could not read document list.");
   }
@@ -524,7 +687,7 @@ async function startDownloads(msg, listingTabId) {
 
   return runTabBatches({
     tasks,
-    listingTabId,
+    listingTabId: resolvedTabId,
     batchSize: msg.batchSize || 10,
     batchPauseMs: msg.batchPauseMs ?? 3000,
     listingUrl: msg.listingUrl,
@@ -550,7 +713,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         listingUrl: msg.listingUrl,
         current: 0,
         total: 0,
-        error: String(e.message || e),
+        error: friendlyConnectionError(e),
       });
     });
     sendResponse({ ok: true, started: true });

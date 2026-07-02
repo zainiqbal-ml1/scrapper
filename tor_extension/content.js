@@ -249,12 +249,25 @@ function pollProgress(statusEl) {
       if (btnY) btnY.disabled = false;
       if (btnA) btnA.disabled = false;
       updateResumeButton();
+    } else if (prog.status === "needs_reload") {
+      statusEl.textContent =
+        prog.error ||
+        "Reload this page (Tor: New Identity), solve captcha, then click Resume.";
+      clearInterval(poll);
+      if (btnY) btnY.disabled = false;
+      if (btnA) btnA.disabled = false;
+      if (btnR) btnR.disabled = false;
+      updateResumeButton();
     }
   }, 1000);
   return poll;
 }
 
 browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === "ping") {
+    sendResponse({ ok: true });
+    return true;
+  }
   if (msg.type === "parse-page") {
     const ctx = CanliiLib.parseDbContext(msg.url || location.href);
     if (!ctx) {
@@ -389,7 +402,10 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const left = job.pending != null ? job.pending : "?";
       const done = job.completed || 0;
       btnResume.style.display = "block";
-      btnResume.textContent = `Resume (${done} done, ${left} left)`;
+      btnResume.textContent =
+        job.status === "needs_reload"
+          ? "Resume after reload"
+          : `Resume (${done} done, ${left} left)`;
     } else {
       btnResume.style.display = "none";
     }
@@ -411,12 +427,14 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       ? (m ? `canlii/${m[2]}` : "canlii")
       : (m && ctx.year ? `canlii/${m[2]}/${ctx.year}` : "canlii");
 
+    let listingUrl = location.href;
     if (resume) {
       const jobRes = await browser.runtime.sendMessage({ type: "get-job" });
       const job = jobRes && jobRes.job;
       if (job) {
         subfolder = job.subfolder || subfolder;
         allYears = !!job.allYears;
+        listingUrl = job.listingUrl || listingUrl;
       }
     }
 
@@ -426,6 +444,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         subfolder,
         skipDone: true,
         resume: !!resume,
+        listingUrl,
       });
       if (!res || !res.ok) {
         throw new Error((res && res.error) || "Download failed");
@@ -468,11 +487,17 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   updateResumeButton();
   browser.runtime.sendMessage({ type: "get-progress" }).then((p) => {
     const prog = p && p.progress;
-    if (prog && prog.status === "running") {
+    if (!prog) return;
+    if (prog.status === "running") {
       btnYear.disabled = true;
       btnAll.disabled = true;
       status.textContent = formatStatus(prog);
       pollProgress(status);
+    } else if (prog.status === "needs_reload") {
+      status.textContent =
+        prog.error ||
+        "Reload this page (Tor: New Identity), solve captcha, then click Resume.";
+      updateResumeButton();
     }
   });
 })();

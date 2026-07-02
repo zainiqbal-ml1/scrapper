@@ -43,7 +43,7 @@ async function tabMessage(type, payload) {
 async function updateResumeButton() {
   const res = await browser.runtime.sendMessage({ type: "get-job" });
   const job = res && res.job;
-  if (!job || !["paused", "cancelled", "error"].includes(job.status)) {
+  if (!job || !["paused", "cancelled", "error", "needs_reload"].includes(job.status)) {
     resumeBtn.style.display = "none";
     return;
   }
@@ -142,6 +142,17 @@ async function pollProgress() {
     setStatus("Paused — click Resume to continue.", "");
     startBtn.disabled = false;
     resumeBtn.disabled = false;
+    updateResumeButton();
+  } else if (p.status === "needs_reload") {
+    setStatus(
+      p.error ||
+        "Reload the CanLII page (Tor: New Identity), solve captcha, then Resume.",
+      "err"
+    );
+    startBtn.disabled = false;
+    resumeBtn.disabled = false;
+    clearInterval(pollTimer);
+    pollTimer = null;
     updateResumeButton();
   }
 }

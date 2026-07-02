@@ -28,6 +28,21 @@ const CanliiStore = (() => {
     await browser.storage.local.set({ [SKIPPED_KEY]: skipped });
   }
 
+  async function unmarkSkipped(pdfUrl) {
+    if (!pdfUrl) return;
+    const data = await browser.storage.local.get(SKIPPED_KEY);
+    const skipped = (data[SKIPPED_KEY] || []).filter((u) => u !== pdfUrl);
+    await browser.storage.local.set({ [SKIPPED_KEY]: skipped });
+  }
+
+  async function unmarkSkippedMany(urls) {
+    if (!urls || !urls.length) return;
+    const data = await browser.storage.local.get(SKIPPED_KEY);
+    const drop = new Set(urls);
+    const skipped = (data[SKIPPED_KEY] || []).filter((u) => !drop.has(u));
+    await browser.storage.local.set({ [SKIPPED_KEY]: skipped });
+  }
+
   async function filterByStorage(tasks, skipDone) {
     if (!skipDone) {
       return { tasks, alreadyDone: 0 };
@@ -54,7 +69,10 @@ const CanliiStore = (() => {
   }
 
   function isResumable(job) {
-    return job && ["paused", "cancelled", "error"].includes(job.status);
+    return (
+      job &&
+      ["paused", "cancelled", "error", "needs_reload"].includes(job.status)
+    );
   }
 
   function jobMatchesPage(job, url, ctx) {
@@ -78,6 +96,8 @@ const CanliiStore = (() => {
     getDoneUrls,
     markDone,
     markSkipped,
+    unmarkSkipped,
+    unmarkSkippedMany,
     filterByStorage,
     saveJob,
     getJob,
