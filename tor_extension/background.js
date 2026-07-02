@@ -113,15 +113,20 @@ async function filterOnDisk(tasks) {
     recent = await browser.downloads.search({
       state: "complete",
       orderBy: ["-startTime"],
-      limit: 8000,
+      limit: 15000,
     });
   } catch (e) {
     return { tasks, fromDisk: 0 };
   }
   const paths = new Set();
+  const basenames = new Set();
   for (const d of recent) {
     if (d.exists === false) continue;
-    paths.add(String(d.filename).replace(/\\/g, "/"));
+    const p = String(d.filename).replace(/\\/g, "/");
+    paths.add(p);
+    paths.add(p.replace(/ \(\d+\)(\.pdf)$/i, "$1"));
+    const base = p.split("/").pop();
+    if (base) basenames.add(base);
   }
   const remaining = [];
   let fromDisk = 0;
@@ -129,17 +134,46 @@ async function filterOnDisk(tasks) {
     const saveAs = String(t.saveAs || "").replace(/\\/g, "/");
     const hit =
       paths.has(saveAs) ||
-      [...paths].some(
-        (p) => p === saveAs || p.endsWith("/" + t.filename)
-      );
+      paths.has(saveAs.replace(/ \(\d+\)(\.pdf)$/i, "$1")) ||
+      basenames.has(t.filename);
     if (hit) {
-      await CanliiStore.markDone(t.pdfUrl);
+      await CanliiStore.markDone(t.pdfUrl, t.saveAs);
       fromDisk += 1;
       continue;
     }
     remaining.push(t);
   }
   return { tasks: remaining, fromDisk };
+}
+
+async function waitForCaptchaOnTab(tabId, listingUrl, progressBase) {
+  const deadline = Date.now() + 600000;
+  let tick = 0;
+  while (Date.now() < deadline) {
+    tick += 1;
+    await saveProgress({
+      ...progressBase,
+      status: "waiting_captcha",
+      error:
+        tick === 1
+          ? "Solve captcha on this CanLII page if shown — downloads start when ready."
+          : "Still waiting for captcha to be solved…",
+    });
+    try {
+      const res = await browser.tabs.sendMessage(tabId, {
+        type: "check-session",
+        listingUrl,
+        requireApi: true,
+      });
+      if (res && res.ok && res.source === "api") return true;
+    } catch (e) {
+      /* tab not ready */
+    }
+    await sleep(3000);
+  }
+  throw new Error(
+    "Captcha not solved — complete the challenge on the CanLII page, then click Resume."
+  );
 }
 
 async function filterPendingTasks(tasks, skipDone) {
@@ -545,7 +579,7 @@ async function runTabBatches({
         }
         noteSuccess();
         completed += 1;
-        await CanliiStore.markDone(task.pdfUrl);
+        await CanliiStore.markDone(task.pdfUrl, task.saveAs);
         outcomes.set(task.pdfUrl, { ok: true });
         await touchJob("running");
         await saveProgress({
@@ -600,7 +634,7 @@ async function runTabBatches({
             }
             noteSuccess();
             completed += 1;
-            await CanliiStore.markDone(task.pdfUrl);
+            await CanliiStore.markDone(task.pdfUrl, task.saveAs);
             outcomes.set(task.pdfUrl, { ok: true });
             continue;
           } catch (e2) {
@@ -683,6 +717,13 @@ async function startDownloads(msg, listingTabId) {
     throw new Error(friendlyConnectionError(e));
   }
 
+  await waitForCaptchaOnTab(resolvedTabId, msg.listingUrl, {
+    listingUrl: msg.listingUrl,
+    current: 0,
+    total: 0,
+    mode: "pdf-tabs",
+  });
+
   const prepType = msg.allYears ? "prepare-all-years" : "prepare-tasks";
   let prep;
   try {
@@ -690,15 +731,22 @@ async function startDownloads(msg, listingTabId) {
       type: prepType,
       listingUrl: msg.listingUrl,
       subfolder: msg.subfolder,
+      requireApi: true,
     });
   } catch (e) {
     throw new Error(friendlyConnectionError(e));
   }
   if (!prep || !prep.ok) {
-    throw new Error((prep && prep.error) || "Could not read document list.");
+    const err = (prep && prep.error) || "Could not read document list.";
+    if (/captcha|403/i.test(err)) {
+      throw new Error(
+        "Captcha not solved — complete the challenge on the CanLII page, then click Resume."
+      );
+    }
+    throw new Error(err);
   }
 
-  const skipDone = msg.skipDone !== false;
+  const skipDone = true;
   const { tasks, alreadyDone } = await filterPendingTasks(prep.tasks, skipDone);
   if (!tasks.length) {
     const n = alreadyDone || prep.totalListed || 0;

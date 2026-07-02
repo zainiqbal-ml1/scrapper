@@ -3,20 +3,50 @@
 const CanliiStore = (() => {
   const DONE_KEY = "canliiPdfDone";
   const SKIPPED_KEY = "canliiPdfSkipped";
+  const DONE_PATHS_KEY = "canliiPdfDonePaths";
   const JOB_KEY = "canliiPdfJob";
 
-  async function getDoneUrls() {
-    const data = await browser.storage.local.get([DONE_KEY, SKIPPED_KEY]);
-    return new Set([...(data[DONE_KEY] || []), ...(data[SKIPPED_KEY] || [])]);
+  function normPath(p) {
+    return String(p || "")
+      .replace(/\\/g, "/")
+      .replace(/ \(\d+\)(\.pdf)$/i, "$1");
   }
 
-  async function markDone(pdfUrl) {
-    if (!pdfUrl) return;
-    const data = await browser.storage.local.get(DONE_KEY);
-    const done = data[DONE_KEY] || [];
-    if (done.includes(pdfUrl)) return;
-    done.push(pdfUrl);
-    await browser.storage.local.set({ [DONE_KEY]: done });
+  async function getDoneKeys() {
+    const data = await browser.storage.local.get([
+      DONE_KEY,
+      SKIPPED_KEY,
+      DONE_PATHS_KEY,
+    ]);
+    return {
+      urls: new Set([...(data[DONE_KEY] || []), ...(data[SKIPPED_KEY] || [])]),
+      paths: new Set((data[DONE_PATHS_KEY] || []).map(normPath)),
+    };
+  }
+
+  async function getDoneUrls() {
+    const { urls } = await getDoneKeys();
+    return urls;
+  }
+
+  async function markDone(pdfUrl, saveAs) {
+    if (pdfUrl) {
+      const data = await browser.storage.local.get(DONE_KEY);
+      const done = data[DONE_KEY] || [];
+      if (!done.includes(pdfUrl)) {
+        done.push(pdfUrl);
+        await browser.storage.local.set({ [DONE_KEY]: done });
+      }
+    }
+    if (saveAs) {
+      const p = normPath(saveAs);
+      const data = await browser.storage.local.get(DONE_PATHS_KEY);
+      const paths = data[DONE_PATHS_KEY] || [];
+      if (!paths.includes(p)) {
+        paths.push(p);
+        await browser.storage.local.set({ [DONE_PATHS_KEY]: paths });
+      }
+    }
   }
 
   async function markSkipped(pdfUrl) {
@@ -47,9 +77,13 @@ const CanliiStore = (() => {
     if (!skipDone) {
       return { tasks, alreadyDone: 0 };
     }
-    const done = await getDoneUrls();
+    const { urls, paths } = await getDoneKeys();
     const before = tasks.length;
-    const filtered = tasks.filter((t) => !done.has(t.pdfUrl));
+    const filtered = tasks.filter((t) => {
+      if (urls.has(t.pdfUrl)) return false;
+      if (t.saveAs && paths.has(normPath(t.saveAs))) return false;
+      return true;
+    });
     return { tasks: filtered, alreadyDone: before - filtered.length };
   }
 
@@ -100,7 +134,9 @@ const CanliiStore = (() => {
     DONE_KEY,
     SKIPPED_KEY,
     JOB_KEY,
+    DONE_PATHS_KEY,
     getDoneUrls,
+    getDoneKeys,
     markDone,
     markSkipped,
     unmarkSkipped,

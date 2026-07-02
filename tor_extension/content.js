@@ -99,7 +99,8 @@ function scrapeItemsFromDom() {
   return items;
 }
 
-async function fetchItems(listingUrl) {
+async function fetchItems(listingUrl, options) {
+  const requireApi = options && options.requireApi;
   const parsed = CanliiLib.parseListingUrl(listingUrl);
   if (!parsed) throw new Error("Not a CanLII nav/date page.");
 
@@ -115,6 +116,16 @@ async function fetchItems(listingUrl) {
     } catch (e) {
       /* fall through */
     }
+  }
+
+  if (res.status === 403 || res.error === "captcha") {
+    throw new Error("Captcha on page — solve it in this Tor window first.");
+  }
+
+  if (requireApi) {
+    throw new Error(
+      res.error || `Items API HTTP ${res.status || "?"} — solve captcha first.`
+    );
   }
 
   const domItems = scrapeItemsFromDom();
@@ -135,8 +146,8 @@ async function fetchItems(listingUrl) {
   );
 }
 
-async function prepareTasks({ listingUrl, subfolder }) {
-  const { parsed, items, source } = await fetchItems(listingUrl);
+async function prepareTasks({ listingUrl, subfolder, requireApi }) {
+  const { parsed, items, source } = await fetchItems(listingUrl, { requireApi });
   const yearFolder = subfolder || `canlii/${parsed.db}/${parsed.year}`;
   const jsonBase = yearFolder.replace(/\/\d{4}\/?$/, "").replace(/\/$/, "") || `canlii/${parsed.db}`;
   const records = CanliiLib.itemsToRecords(items, yearFolder);
@@ -158,7 +169,7 @@ async function prepareTasks({ listingUrl, subfolder }) {
   };
 }
 
-async function prepareAllYearsTasks({ listingUrl, subfolder }) {
+async function prepareAllYearsTasks({ listingUrl, subfolder, requireApi }) {
   const ctx = CanliiLib.parseDbContext(listingUrl || location.href);
   if (!ctx) throw new Error("Not a CanLII database page.");
 
@@ -173,6 +184,7 @@ async function prepareAllYearsTasks({ listingUrl, subfolder }) {
       const prep = await prepareTasks({
         listingUrl: yearUrl,
         subfolder: `${base}/${year}`,
+        requireApi,
       });
       Object.assign(yearRecords, prep.yearRecords);
       allTasks = allTasks.concat(prep.tasks);
@@ -228,6 +240,8 @@ function pollProgress(statusEl) {
     const btnR = document.getElementById("canlii-pdf-resume-btn");
     if (prog.status === "running") {
       statusEl.textContent = formatStatus(prog);
+    } else if (prog.status === "waiting_captcha") {
+      statusEl.textContent = prog.error || "Solve captcha on this page…";
     } else if (prog.status === "recovering") {
       statusEl.textContent = prog.error || "Opening fresh Tor window…";
     } else if (prog.status === "done") {
@@ -286,6 +300,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.type === "check-session") {
     const url = msg.listingUrl || location.href;
+    const requireApi = !!msg.requireApi;
     const ctx = CanliiLib.parseDbContext(url);
     if (!ctx) {
       sendResponse({ ok: false, error: "Not a CanLII page." });
@@ -305,14 +320,20 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           );
           if (res.ok && res.text) {
             const items = JSON.parse(res.text);
-            sendResponse({ ok: Array.isArray(items) && items.length > 0 });
+            const ok = Array.isArray(items) && items.length > 0;
+            sendResponse({ ok, source: "api" });
             return;
           }
           if (res.error === "captcha" || res.status === 403) {
             sendResponse({ ok: false, captcha: true });
             return;
           }
-          sendResponse({ ok: false });
+          if (requireApi) {
+            sendResponse({ ok: false, captcha: res.status === 403 });
+            return;
+          }
+          const domItems = scrapeItemsFromDom();
+          sendResponse({ ok: domItems.length > 0, source: "dom" });
         } catch (e) {
           sendResponse({ ok: false, error: String(e.message || e) });
         }
@@ -542,13 +563,15 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   browser.runtime.sendMessage({ type: "get-progress" }).then((p) => {
     const prog = p && p.progress;
     if (!prog) return;
-    if (prog.status === "running" || prog.status === "recovering") {
+    if (prog.status === "running" || prog.status === "recovering" || prog.status === "waiting_captcha") {
       btnYear.disabled = true;
       btnAll.disabled = true;
       status.textContent =
-        prog.status === "recovering"
-          ? prog.error || "Opening fresh Tor window…"
-          : formatStatus(prog);
+        prog.status === "waiting_captcha"
+          ? prog.error || "Solve captcha on this page…"
+          : prog.status === "recovering"
+            ? prog.error || "Opening fresh Tor window…"
+            : formatStatus(prog);
       pollProgress(status);
     } else if (prog.status === "needs_new_identity") {
       status.textContent =

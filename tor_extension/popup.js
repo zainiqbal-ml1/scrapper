@@ -144,6 +144,10 @@ async function pollProgress() {
     startBtn.disabled = false;
     resumeBtn.disabled = false;
     updateResumeButton();
+  } else if (p.status === "waiting_captcha") {
+    setStatus(p.error || "Solve captcha on the CanLII page…", "ok");
+    startBtn.disabled = true;
+    resumeBtn.disabled = true;
   } else if (p.status === "recovering") {
     setStatus(p.error || "Opening fresh Tor window — solve captcha if shown…", "ok");
     startBtn.disabled = true;

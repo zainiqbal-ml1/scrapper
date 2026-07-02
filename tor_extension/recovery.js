@@ -40,21 +40,39 @@ const CanliiRecovery = (() => {
     return CanliiLib.listingUrl(ctx.juris, ctx.db, String(new Date().getFullYear()));
   }
 
-  async function waitForSession(tabId, listingUrl, timeoutMs = 600000) {
+  async function waitForSession(tabId, listingUrl, job, timeoutMs = 600000) {
     const deadline = Date.now() + timeoutMs;
+    let tick = 0;
     while (Date.now() < deadline) {
+      tick += 1;
+      if (saveProgressFn) {
+        await saveProgressFn({
+          status: "waiting_captcha",
+          listingUrl,
+          current: (job && job.completed) || 0,
+          total: (job && job.total) || 0,
+          skipped: (job && job.skipped) || 0,
+          alreadyDone: (job && job.alreadyDone) || 0,
+          error:
+            tick === 1
+              ? "Solve captcha on the CanLII page — downloads start when ready."
+              : "Still waiting for captcha to be solved…",
+          mode: "pdf-tabs",
+        });
+      }
       if (await pingTabFn(tabId)) {
         try {
           const res = await browser.tabs.sendMessage(tabId, {
             type: "check-session",
             listingUrl,
+            requireApi: true,
           });
-          if (res && res.ok) return true;
+          if (res && res.ok && res.source === "api") return true;
         } catch (e) {
           /* not ready */
         }
       }
-      await sleep(4000);
+      await sleep(3000);
     }
     return false;
   }
@@ -103,7 +121,7 @@ const CanliiRecovery = (() => {
     const tabId = await openListingPage(needUrl);
     if (!tabId) return false;
 
-    const ready = await waitForSession(tabId, needUrl);
+    const ready = await waitForSession(tabId, needUrl, job);
     if (!ready) {
       await CanliiStore.saveJob({
         ...job,
