@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "CanLII PDF Bulk Download",
-  "version": "1.5.2",
+  "version": "1.6.0",
   "description": "Bulk-download CanLII PDFs in Tor Browser — resume, skip existing, per-year JSON.",
   "applications": {
     "gecko": {

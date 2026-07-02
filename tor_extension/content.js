@@ -216,8 +216,8 @@ function startDownloadMessage(extra) {
   return browser.runtime.sendMessage({
     type: "start-downloads",
     listingUrl: location.href,
-    batchSize: 10,
-    batchPauseMs: 3000,
+    batchSize: 5,
+    batchPauseMs: 4000,
     ...extra,
   });
 }
@@ -386,7 +386,11 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .then(() =>
         pageCall(
           "fetch-pdf",
-          { pdfPath: msg.pdfPath, pdfPaths: msg.pdfPaths },
+          {
+            pdfPath: msg.pdfPath,
+            pdfPaths: msg.pdfPaths,
+            referer: msg.referer || location.href,
+          },
           180000
         )
       )

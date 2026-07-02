@@ -1,7 +1,8 @@
 /* global browser, CanliiLib */
 
 const PROGRESS_KEY = "canliiPdfProgress";
-const CONSECUTIVE_404_LIMIT = 3;
+const PDF_DELAY_MS = 1200;
+const PDF_DELAY_JITTER_MS = 400;
 let cancelRequested = false;
 
 function sleep(ms) {
@@ -233,6 +234,7 @@ async function fetchPdfFromListing(listingTabId, task) {
       type: "fetch-pdf-b64",
       pdfPath: task.pdfPath,
       pdfPaths: task.pdfPaths || [task.pdfPath],
+      referer: task.htmlUrl,
     });
   } catch (e) {
     const err = String(e.message || e);
@@ -250,10 +252,7 @@ async function fetchPdfFromListing(listingTabId, task) {
       return { skipped: true, reason: "404" };
     }
     if (res && res.error === "not-pdf") {
-      return { blocked: true, error: "captcha/block (not a PDF)" };
-    }
-    if (status === 403 || err === "captcha") {
-      return { blocked: true, error: err };
+      throw new Error(`${task.filename}: captcha/block (not a PDF)`);
     }
     throw new Error(
       `${task.filename}: HTTP ${status || err} — ${task.pdfUrl}`
@@ -367,8 +366,8 @@ async function closeTabs(tabIds) {
 async function runTabBatches({
   tasks,
   listingTabId,
-  batchSize = 10,
-  batchPauseMs = 3000,
+  batchSize = 5,
+  batchPauseMs = 4000,
   listingUrl,
   source,
   yearRecords,
@@ -383,8 +382,6 @@ async function runTabBatches({
   cancelRequested = false;
   let completed = 0;
   let skipped = 0;
-  let consecutive404 = 0;
-  let streak404Urls = [];
   const outcomes = new Map();
 
   async function touchJob(status) {
@@ -402,10 +399,6 @@ async function runTabBatches({
   }
 
   async function pauseForCircuitReload(customMsg) {
-    await CanliiStore.unmarkSkippedMany(streak404Urls);
-    consecutive404 = 0;
-    streak404Urls = [];
-
     const progress = {
       completed,
       skipped,
@@ -439,11 +432,10 @@ async function runTabBatches({
 
     const errMsg =
       customMsg ||
-      `${CONSECUTIVE_404_LIMIT} PDFs returned 404 in a row — likely blocked. ` +
-      "Reload this CanLII page (Tor: New Identity or refresh), solve captcha, then click Resume.";
-    await touchJob("needs_reload");
+      "Blocked — click Tor → New Identity, then Resume.";
+    await touchJob("needs_new_identity");
     await saveProgress({
-      status: "needs_reload",
+      status: "needs_new_identity",
       listingUrl,
       current: completed,
       total: tasks.length,
@@ -451,7 +443,7 @@ async function runTabBatches({
       alreadyDone,
       error: errMsg,
       source,
-      mode: "pdf-tabs",
+      mode: "fetch-only",
     });
     return {
       needsReload: true,
@@ -462,25 +454,6 @@ async function runTabBatches({
     };
   }
 
-  async function handleTask404(task) {
-    streak404Urls.push(task.pdfUrl);
-    consecutive404 += 1;
-    outcomes.set(task.pdfUrl, { skipped: true, error: "HTTP 404" });
-
-    if (consecutive404 >= CONSECUTIVE_404_LIMIT) {
-      return { pause: true };
-    }
-
-    await CanliiStore.markSkipped(task.pdfUrl);
-    skipped += 1;
-    return { pause: false };
-  }
-
-  function noteSuccess() {
-    consecutive404 = 0;
-    streak404Urls = [];
-  }
-
   await saveProgress({
     status: "running",
     listingUrl,
@@ -489,11 +462,11 @@ async function runTabBatches({
     skipped: 0,
     alreadyDone,
     source,
-    mode: "pdf-tabs",
+    mode: "fetch-only",
   });
   await touchJob("running");
 
-  for (let i = 0; i < tasks.length; i += batchSize) {
+  for (let i = 0; i < tasks.length; i++) {
     if (cancelRequested) {
       await touchJob("paused");
       await saveProgress({
@@ -508,76 +481,42 @@ async function runTabBatches({
       return { cancelled: true, total: tasks.length };
     }
 
-    const batch = tasks.slice(i, i + batchSize);
-    const slots = [];
+    const task = tasks[i];
+    const batchNum = Math.floor(i / batchSize) + 1;
 
-    for (const task of batch) {
-      if (cancelRequested) break;
-      if (!task.pdfUrl || !task.pdfUrl.startsWith("https://")) {
-        skipped += 1;
-        outcomes.set(task.pdfUrl || task.filename, {
-          skipped: true,
-          error: "invalid url",
-        });
-        continue;
-      }
-      const opts = { url: task.pdfUrl, active: false, openerTabId: listingTabId };
-      // Open PDF tab (try /en/ variant if primary 404s in tab)
-      let tab;
-      try {
-        tab = await browser.tabs.create(opts);
-      } catch (e) {
-        const alt = task.pdfPaths && task.pdfPaths[1];
-        if (!alt) throw e;
-        tab = await browser.tabs.create({
-          url: "https://www.canlii.org" + alt,
-          active: false,
-          openerTabId: listingTabId,
-        });
-      }
-      slots.push({ tabId: tab.id, task });
-      await sleep(400);
+    if (!task.pdfUrl || !task.pdfUrl.startsWith("https://")) {
+      skipped += 1;
+      outcomes.set(task.pdfUrl || task.filename, {
+        skipped: true,
+        error: "invalid url",
+      });
+      continue;
     }
 
-    await Promise.all(slots.map((s) => waitTabComplete(s.tabId).catch(() => {})));
-
-    for (const slot of slots) {
-      if (cancelRequested) break;
-      const { tabId, task } = slot;
-      try {
-        const result = await fetchPdfFromListing(listingTabId, task);
-        if (result.connectionLost) {
-          return pauseForCircuitReload(
-            "Lost connection — opening fresh Tor window…"
-          );
-        }
-        if (result.blocked) {
-          return pauseForCircuitReload(
-            `Blocked — opening fresh Tor window (${result.error || "403"})…`
-          );
-        }
-        if (result.skipped) {
-          const h404 = await handleTask404(task);
-          if (h404.pause) {
-            return pauseForCircuitReload();
-          }
-          await touchJob("running");
-          await saveProgress({
-            status: "running",
-            listingUrl,
-            current: completed,
-            total: tasks.length,
-            skipped,
-            alreadyDone,
-            last: `skipped 404: ${task.filename}`,
-            year: task.year || (task.saveAs && task.saveAs.match(/\/(\d{4})\/[^/]+$/)?.[1]),
-            source,
-            mode: "pdf-tabs",
-            batch: Math.floor(i / batchSize) + 1,
-          });
-          continue;
-        }
-        noteSuccess();
+    try {
+      const result = await fetchPdfFromListing(listingTabId, task);
+      if (result.connectionLost) {
+        return pauseForCircuitReload(
+          "Lost connection — click Tor → New Identity, then Resume."
+        );
+      }
+      if (result.skipped) {
+        skipped += 1;
+        outcomes.set(task.pdfUrl, { skipped: true, error: "HTTP 404" });
+        await saveProgress({
+          status: "running",
+          listingUrl,
+          current: completed,
+          total: tasks.length,
+          skipped,
+          alreadyDone,
+          last: `skipped 404: ${task.filename}`,
+          year: task.year,
+          source,
+          mode: "fetch-only",
+          batch: batchNum,
+        });
+      } else {
         completed += 1;
         await CanliiStore.markDone(task.pdfUrl, task.saveAs);
         outcomes.set(task.pdfUrl, { ok: true });
@@ -590,59 +529,51 @@ async function runTabBatches({
           skipped,
           alreadyDone,
           last: task.filename,
-          year: task.year || (task.saveAs && task.saveAs.match(/\/(\d{4})\/[^/]+$/)?.[1]),
+          year: task.year,
           source,
-          mode: "pdf-tabs",
-          batch: Math.floor(i / batchSize) + 1,
+          mode: "fetch-only",
+          batch: batchNum,
         });
-      } catch (e) {
-        const msg = String(e.message || e);
-        if (isSkippableError(msg)) {
-          const h404 = await handleTask404(task);
-          if (h404.pause) {
-            return pauseForCircuitReload();
+      }
+    } catch (e) {
+      const msg = String(e.message || e);
+      if (isSkippableError(msg)) {
+        skipped += 1;
+        outcomes.set(task.pdfUrl, { skipped: true, error: msg });
+        await saveProgress({
+          status: "running",
+          listingUrl,
+          current: completed,
+          total: tasks.length,
+          skipped,
+          alreadyDone,
+          last: `skipped: ${task.filename}`,
+          source,
+          mode: "fetch-only",
+        });
+      } else if (isRetryableBlock(msg)) {
+        await sleep(10000);
+        try {
+          const retry = await fetchPdfFromListing(listingTabId, task);
+          if (retry.connectionLost) {
+            return pauseForCircuitReload(
+              "Lost connection — click Tor → New Identity, then Resume."
+            );
           }
-          await touchJob("running");
-          await saveProgress({
-            status: "running",
-            listingUrl,
-            current: completed,
-            total: tasks.length,
-            skipped,
-            alreadyDone,
-            last: `skipped: ${task.filename}`,
-            source,
-            mode: "pdf-tabs",
-          });
-          continue;
-        }
-        if (isRetryableBlock(msg)) {
-          await sleep(5000);
-          try {
-            await browser.tabs.update(tabId, { url: task.pdfUrl });
-            await waitTabComplete(tabId);
-            const retry = await fetchPdfFromListing(listingTabId, task);
-            if (retry.connectionLost) {
-              return pauseForCircuitReload("Connection lost — rotating Tor session…");
-            }
-            if (retry.skipped) {
-              const h404 = await handleTask404(task);
-              if (h404.pause) {
-                return pauseForCircuitReload();
-              }
-              continue;
-            }
-            noteSuccess();
+          if (retry.skipped) {
+            skipped += 1;
+            outcomes.set(task.pdfUrl, { skipped: true, error: "HTTP 404" });
+          } else {
             completed += 1;
             await CanliiStore.markDone(task.pdfUrl, task.saveAs);
             outcomes.set(task.pdfUrl, { ok: true });
-            continue;
-          } catch (e2) {
-            return pauseForCircuitReload(
-              `Blocked (${task.filename}) — opening fresh Tor window…`
-            );
           }
+        } catch (e2) {
+          return pauseForCircuitReload(
+            `Blocked at ${task.filename} — click Tor → New Identity, then Resume.`
+          );
         }
+      } else {
         await touchJob("error");
         await saveProgress({
           status: "error",
@@ -655,13 +586,14 @@ async function runTabBatches({
         });
         await saveYearIndexes(yearRecords, outcomes, jsonBase).catch(() => {});
         throw e;
-      } finally {
-        await browser.tabs.remove(tabId).catch(() => {});
       }
-      await sleep(600);
     }
 
-    if (i + batchSize < tasks.length && batchPauseMs > 0) {
+    const delay =
+      PDF_DELAY_MS + Math.floor(Math.random() * PDF_DELAY_JITTER_MS);
+    await sleep(delay);
+
+    if ((i + 1) % batchSize === 0 && i + 1 < tasks.length && batchPauseMs > 0) {
       await saveProgress({
         status: "running",
         listingUrl,
@@ -669,7 +601,7 @@ async function runTabBatches({
         total: tasks.length,
         last: `batch pause (${batchPauseMs}ms)`,
         source,
-        mode: "pdf-tabs",
+        mode: "fetch-only",
       });
       await sleep(batchPauseMs);
     }
@@ -761,8 +693,8 @@ async function startDownloads(msg, listingTabId) {
     allYears: !!msg.allYears,
     subfolder: msg.subfolder,
     jsonBase: prep.jsonBase,
-    batchSize: msg.batchSize || 10,
-    batchPauseMs: msg.batchPauseMs ?? 3000,
+    batchSize: msg.batchSize || 5,
+    batchPauseMs: msg.batchPauseMs ?? 4000,
     db: parsed.db,
     juris: parsed.juris,
     year: parsed.year,
@@ -773,8 +705,8 @@ async function startDownloads(msg, listingTabId) {
   return runTabBatches({
     tasks,
     listingTabId: resolvedTabId,
-    batchSize: msg.batchSize || 10,
-    batchPauseMs: msg.batchPauseMs ?? 3000,
+    batchSize: msg.batchSize || 5,
+    batchPauseMs: msg.batchPauseMs ?? 4000,
     listingUrl: msg.listingUrl,
     source: prep.source,
     years: prep.years,

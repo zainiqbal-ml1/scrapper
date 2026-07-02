@@ -22,10 +22,12 @@
     return btoa(bin);
   }
 
-  async function fetchPdfPath(pdfPath) {
+  async function fetchPdfPath(pdfPath, referer) {
+    const headers = { Accept: "application/pdf,*/*" };
+    if (referer) headers.Referer = referer;
     const r = await fetch(pdfPath, {
       credentials: "same-origin",
-      headers: { Accept: "application/pdf,*/*" },
+      headers,
     });
     if (!r.ok) {
       return { ok: false, status: r.status };
@@ -95,6 +97,7 @@
 
     if (type === "fetch-pdf") {
       const paths = payload.pdfPaths || [payload.pdfPath];
+      const referer = payload.referer || window.location.href;
       try {
         for (const pdfPath of paths) {
           if (!pdfPath) continue;
@@ -107,7 +110,7 @@
             }
           }
           if (!p.startsWith("/")) p = "/" + p;
-          const res = await fetchPdfPath(p);
+          const res = await fetchPdfPath(p, referer);
           if (res.ok) {
             reply(res);
             return;
