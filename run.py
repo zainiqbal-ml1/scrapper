@@ -15,7 +15,7 @@ Non-interactive (pass everything):
     python run.py --juris on --db all --years all
     python run.py --juris on --db onca onsc --years 2020-2024 --rate 3
     python run.py --juris on --db onca --years 2024 --rate 0.1-0.2
-    python run.py --tor --juris on --db onca --years 2024 --rate 0.1-0.2 --good-exit-threshold 10
+    python run.py --tor --new-ip --juris on --db onca --years 2024 --rate 0.1-0.2
     python run.py --juris all --db all --years all
 """
 import subprocess
@@ -134,6 +134,14 @@ def select_good_exit_threshold(*, use_tor: bool) -> int:
         return default
 
 
+def select_force_new_ip(*, use_tor: bool) -> bool:
+    """Ask whether to rotate Tor to a new exit before starting."""
+    if not use_tor:
+        return False
+    raw = input("Force new Tor exit IP? [y/N] (when current IP is blocked): ").strip().lower()
+    return raw in {"y", "yes", "1"}
+
+
 def select_tor(*, default: bool | None = None) -> bool:
     """Ask whether to route CanLII traffic through local Tor."""
     if default is not None:
@@ -154,11 +162,12 @@ def _tor_from_flags(args: list[str]) -> bool | None:
 def interactive_select(*, tor_default: bool | None = None):
     """Prompt for jurisdiction -> db(s) -> years -> rate -> good-exit -> Tor.
 
-    Returns (juris, db_list, years, rate, use_tor, good_exit_threshold).
+    Returns (juris, db_list, years, rate, use_tor, good_exit_threshold, force_new_ip).
     """
     juris = cs.select_jurisdiction()
     print(flush=True)  # newline after selection so status line is visible
     use_tor = select_tor(default=tor_default)
+    force_new_ip = False
     if use_tor:
         try:
             tor_util.configure(use_tor=True)
@@ -167,18 +176,22 @@ def interactive_select(*, tor_default: bool | None = None):
             print("Continuing without Tor.\n", flush=True)
             use_tor = False
             tor_util.configure(use_tor=False)
+        else:
+            force_new_ip = select_force_new_ip(use_tor=use_tor)
+            if force_new_ip:
+                tor_util.force_new_exit()
     if juris == "all":
         years = cs.select_years()
         rate = select_rate()
         good_exit = select_good_exit_threshold(use_tor=use_tor)
         print("\nAll jurisdictions selected -> every database.")
-        return "all", ["all"], years, rate, use_tor, good_exit
+        return "all", ["all"], years, rate, use_tor, good_exit, force_new_ip
     dbs = _discover_dbs_with_refresh(juris)
     chosen = cs.select_databases(dbs)
     years = cs.select_years()
     rate = select_rate()
     good_exit = select_good_exit_threshold(use_tor=use_tor)
-    return juris, chosen, years, rate, use_tor, good_exit
+    return juris, chosen, years, rate, use_tor, good_exit, force_new_ip
 
 
 def run_scrape(
@@ -191,6 +204,7 @@ def run_scrape(
     max_restarts: int = DEFAULT_MAX_RESTARTS,
     use_tor: bool = False,
     good_exit_threshold: int = tor_util.DEFAULT_GOOD_EXIT_PDF_THRESHOLD,
+    force_new_ip: bool = False,
 ) -> int:
     """Single-worker scrape with a request/sec cap; resume same settings on hard block."""
     cmd = [sys.executable, "parallel_scraper.py", "--juris", juris, "--db", *db_list,
@@ -198,6 +212,8 @@ def run_scrape(
            "--good-exit-threshold", str(good_exit_threshold)]
     if use_tor:
         cmd.append("--tor")
+    if use_tor and force_new_ip:
+        cmd.append("--new-ip")
     restarts = 0
     while True:
         rc = subprocess.call(cmd)
@@ -236,10 +252,13 @@ def main() -> int:
         os.environ["CANLII_IGNORE_API"] = "1"
 
     tor_flag = _tor_from_flags(args)
+    force_new_ip = "--new-ip" in args
 
     if not args:
         try:
-            juris, db_list, years, rate, use_tor, good_exit = interactive_select(tor_default=tor_flag)
+            juris, db_list, years, rate, use_tor, good_exit, force_new_ip = interactive_select(
+                tor_default=tor_flag,
+            )
         except (KeyboardInterrupt, EOFError):
             print("\nCancelled.")
             return 130
@@ -274,19 +293,26 @@ def main() -> int:
 
     print(f"\nPlan: juris={juris} db={' '.join(db_list)} years={years} "
           f"rate={rate} req/s good-exit={good_exit}+ PDFs"
-          f"{' (Tor)' if use_tor else ''} "
+          f"{' (Tor)' if use_tor else ''}"
+          f"{' new-ip' if use_tor and force_new_ip else ''} "
           f"| OS: {platform_util.system()} "
           f"| harvest: {platform_util.harvest_backend()}\n"
           f"Restart on temporary block: delay={restart_delay:g}s "
           f"max={max_restarts if max_restarts > 0 else 'unlimited'}\n")
     canlii_api.print_status()
     tor_util.print_status()
+    if use_tor and force_new_ip and args:
+        tor_util.force_new_exit()
     tor_util.print_ip()
     auto_refresh.print_harvest_capabilities(force_recheck=True)
     print(flush=True)
 
-    if juris != "all" and not canlii_api.enabled() and not ensure_session_or_refresh(juris):
-        return 130
+    if juris != "all" and not canlii_api.enabled():
+        if force_new_ip and use_tor:
+            if not refresh_until_valid(juris):
+                return 130
+        elif not ensure_session_or_refresh(juris):
+            return 130
     if juris != "all" and canlii_api.enabled() and not cs.check_session(juris):
         print("Session not verified yet — PDF downloads will refresh the cookie if blocked.\n", flush=True)
 
@@ -299,6 +325,7 @@ def main() -> int:
         max_restarts=max_restarts,
         use_tor=use_tor,
         good_exit_threshold=good_exit,
+        force_new_ip=force_new_ip,
     )
 
 

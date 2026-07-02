@@ -556,6 +556,8 @@ def main() -> int:
                     help="Disable the single background backup cookie harvest")
     ap.add_argument("--tor", action="store_true",
                     help="Route downloads and harvest through local Tor (SOCKS 9050/9150)")
+    ap.add_argument("--new-ip", action="store_true",
+                    help="Tor: force a new exit IP before harvest (banned IP escape hatch)")
     args = ap.parse_args()
 
     if args.tor or os.environ.get("CANLII_USE_TOR", "").strip().lower() in {"1", "true", "yes"}:
@@ -574,6 +576,8 @@ def main() -> int:
     grand = {"total": 0, "downloaded": 0, "failed": 0}
 
     tor_on = tor_util.enabled()
+    if tor_on and args.new_ip:
+        tor_util.force_new_exit()
     backup_enabled = not args.no_backup_cookie and not tor_on
     if tor_on and not args.no_backup_cookie:
         print(

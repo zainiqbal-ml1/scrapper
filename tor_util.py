@@ -13,6 +13,7 @@ _ip: str | None = None
 _last_cookie_ip: str | None = None
 _keep_same_exit = False
 _last_burn_downloads = 0
+_forced_fresh_exit = False
 DEFAULT_GOOD_EXIT_PDF_THRESHOLD = 10
 GOOD_EXIT_PDF_THRESHOLD = DEFAULT_GOOD_EXIT_PDF_THRESHOLD
 _MAX_ROTATE_ATTEMPTS = 6
@@ -112,6 +113,24 @@ def invalidate_ip() -> None:
 def _clear_keep_exit() -> None:
     global _keep_same_exit
     _keep_same_exit = False
+
+
+def force_new_exit(*, quiet: bool = False) -> bool:
+    """Rotate to a new Tor exit, ignoring good-exit reuse (banned IP escape hatch)."""
+    global _last_burn_downloads, _last_cookie_ip, _forced_fresh_exit
+    _clear_keep_exit()
+    _last_burn_downloads = 0
+    _last_cookie_ip = None
+    _forced_fresh_exit = True
+    if not enabled():
+        return False
+    if not quiet:
+        print(f"[tor] Forcing new exit (was {public_ip()})...", flush=True)
+    invalidate_ip()
+    ok = rotate_for_new_cookie(quiet=quiet)
+    if ok and not quiet:
+        print(f"[tor] New exit: {public_ip(force=True)}\n", flush=True)
+    return ok
 
 
 def public_ip(*, force: bool = False) -> str:
@@ -249,7 +268,11 @@ def note_cookie_burn(downloads_since_cookie: int) -> None:
 
 def prepare_cookie_refresh(*, quiet: bool = False, force_rotate: bool = False) -> bool:
     """Rotate Tor exit only when the last cookie burned too quickly."""
+    global _forced_fresh_exit
     if not enabled():
+        return False
+    if _forced_fresh_exit:
+        _forced_fresh_exit = False
         return False
     if not force_rotate and _keep_same_exit:
         if not quiet:
